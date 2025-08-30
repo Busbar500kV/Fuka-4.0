@@ -1,77 +1,162 @@
+"""
+Fuka 4.0 — Parquet recorder with shard indices.
+
+Tables supported:
+  - events(step, conn_id, x,y,z, dF, dm, w_sel, A_sel, phi_sel, T_eff, theta_thr, ...)
+  - spectra(step, conn_id, w_dom, A_dom, phi_dom, F_local, E_sum, S_spec, ...)
+  - state(step, conn_id, x,y,z, m, T_eff, theta_thr, ...)
+  - ledger(step, dF, c2dm, Q, W_cat, net_flux, balance_error, ...)
+  - edges(step, src_conn, dst_conn, weight, [optional: w, phi], [x,y,z optional])
+  - env(step, x, y, z, value, [conn_id optional])
+
+Each table is buffered in-memory and flushed to Parquet shards like:
+  data/runs/<RUN_ID>/shards/<table>_000.parquet
+
+We also maintain a manifest.json under:
+  data/runs/<RUN_ID>/manifest.json
+
+NOTE:
+- We write simple, wide parquet files (one row = one log line).
+- We convert "xmu" (t, x, y, z) tuples into scalar columns t/x/y/z before flush.
+"""
+
 from __future__ import annotations
-import time, json
+import json
+import os
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-class Recorder:
-    def __init__(self, run_id: str, root: Path):
+
+class ParquetRecorder:
+    def __init__(self, data_root: str, run_id: str, flush_every: int = 1000):
+        self.data_root = Path(data_root)
         self.run_id = run_id
-        self.root = Path(root)
-        self.run_dir = self.root / "runs" / run_id
-        (self.run_dir / "shards").mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+        self.flush_every = int(flush_every)
 
-        self._events_buf: List[Dict[str, Any]] = []
-        self._spectra_buf: List[Dict[str, Any]] = []
-        self._state_buf: List[Dict[str, Any]] = []
-        self._ledger_buf: List[Dict[str, Any]] = []
+        self.run_dir = self.data_root / "runs" / self.run_id
+        self.shards_dir = self.run_dir / "shards"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.shards_dir.mkdir(parents=True, exist_ok=True)
 
-        self._counts = {"events":0, "spectra":0, "state":0, "ledger":0}
-        self._shard_idx = {"events":0, "spectra":0, "state":0, "ledger":0}
+        # table -> list[dict]
+        self._buf: Dict[str, List[Dict[str, Any]]] = {
+            "events": [], "spectra": [], "state": [], "ledger": [],
+            "edges": [], "env": []
+        }
 
-        # write manifest skeleton
-        (self.run_dir / "manifest.json").write_text(json.dumps({
-            "run_id": run_id, "created_at": time.time(), "shards":[]
-        }, indent=2))
+        # table -> next shard index
+        self._next_idx: Dict[str, int] = {k: 0 for k in self._buf.keys()}
 
-    def log_event(self, **row):
+        # manifest
+        self.manifest_path = self.run_dir / "manifest.json"
+        self._manifest = {
+            "run_id": self.run_id,
+            "created_at": float(pd.Timestamp.now().timestamp()),
+            "shards": []  # list of {"table": <t>, "path": <relative>}
+        }
+        if self.manifest_path.exists():
+            # resume / append mode
+            try:
+                self._manifest = json.loads(self.manifest_path.read_text())
+                # best-effort: infer next indices from existing shard names
+                for s in self._manifest.get("shards", []):
+                    t = s.get("table")
+                    p = Path(s.get("path", ""))
+                    stem = p.stem  # e.g., "events_003"
+                    if "_" in stem:
+                        try:
+                            idx = int(stem.split("_")[-1])
+                            self._next_idx[t] = max(self._next_idx.get(t, 0), idx + 1)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # simple counters to decide when to flush
+        self._since_flush = 0
+
+    # -------------- helpers --------------
+
+    def _with_common(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize row: inject run_id and expand xmu->[t,x,y,z] if present."""
+        row = dict(row)
         row["run_id"] = self.run_id
-        self._events_buf.append(row)
-        self._counts["events"] += 1
+        if "xmu" in row:
+            t, x, y, z = row["xmu"]
+            row.pop("xmu", None)
+            row["t"] = float(t)
+            row["x"] = float(x); row["y"] = float(y); row["z"] = float(z)
+        return row
 
-    def log_spectra(self, **row):
-        row["run_id"] = self.run_id
-        self._spectra_buf.append(row)
-        self._counts["spectra"] += 1
-
-    def log_state(self, **row):
-        row["run_id"] = self.run_id
-        self._state_buf.append(row)
-        self._counts["state"] += 1
-
-    def log_ledger(self, **row):
-        row["run_id"] = self.run_id
-        self._ledger_buf.append(row)
-        self._counts["ledger"] += 1
-
-    def _flush(self, name: str, buf: List[Dict[str, Any]]):
-        if not buf: return None
+    def _flush_table(self, table: str) -> Optional[Path]:
+        buf = self._buf[table]
+        if not buf:
+            return None
         df = pd.DataFrame(buf)
-        shard_idx = self._shard_idx[name]
-        shard_path = self.run_dir / "shards" / f"{name}_{shard_idx:03d}.parquet"
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        pq.write_table(table, shard_path)
-        self._shard_idx[name] += 1
-        buf.clear()
-        return str(shard_path)
+        self._buf[table] = []
+
+        shard_idx = self._next_idx[table]
+        self._next_idx[table] += 1
+
+        rel = Path("data") / "runs" / self.run_id / "shards" / f"{table}_{shard_idx:03d}.parquet"
+        abs_path = self.data_root / "runs" / self.run_id / "shards" / f"{table}_{shard_idx:03d}.parquet"
+
+        table_arrow = pa.Table.from_pandas(df, preserve_index=False)
+        pq.write_table(table_arrow, abs_path)
+
+        self._manifest["shards"].append({"table": table, "path": str(rel)})
+        return abs_path
+
+    def _maybe_flush(self):
+        self._since_flush += 1
+        if self._since_flush >= self.flush_every:
+            self.flush_all()
+            self._since_flush = 0
 
     def flush_all(self):
-        written = {}
-        written["events"] = self._flush("events", self._events_buf)
-        written["spectra"] = self._flush("spectra", self._spectra_buf)
-        written["state"] = self._flush("state", self._state_buf)
-        written["ledger"] = self._flush("ledger", self._ledger_buf)
-
-        # append to manifest
-        manifest_path = self.run_dir / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        for k, p in written.items():
-            if p:
-                manifest["shards"].append({"table": k, "path": p})
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        written_any = False
+        for t in self._buf.keys():
+            p = self._flush_table(t)
+            if p is not None:
+                written_any = True
+        if written_any:
+            self.manifest_path.write_text(json.dumps(self._manifest, indent=2))
 
     def finalize(self):
         self.flush_all()
+        # final sync of manifest
+        self.manifest_path.write_text(json.dumps(self._manifest, indent=2))
+
+    # -------------- public loggers --------------
+
+    def log_event(self, **row):
+        self._buf["events"].append(self._with_common(row))
+        self._maybe_flush()
+
+    def log_spectra(self, **row):
+        self._buf["spectra"].append(self._with_common(row))
+        self._maybe_flush()
+
+    def log_state(self, **row):
+        self._buf["state"].append(self._with_common(row))
+        self._maybe_flush()
+
+    def log_ledger(self, **row):
+        self._buf["ledger"].append(self._with_common(row))
+        self._maybe_flush()
+
+    # NEW
+    def log_edge(self, **row):
+        """Row should contain: src_conn, dst_conn, step, weight, [w, phi], [x,y,z optional]."""
+        self._buf["edges"].append(self._with_common(row))
+        self._maybe_flush()
+
+    # NEW
+    def log_env(self, **row):
+        """Row should contain: step, x, y, z, value, [conn_id optional]."""
+        self._buf["env"].append(self._with_common(row))
+        self._maybe_flush()
