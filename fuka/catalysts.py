@@ -1,30 +1,58 @@
+# fuka/catalysts.py
+"""
+Catalyst token field that diffuses / propagates locally and returns transfers.
+
+We keep it intentionally simple and local:
+  - self.field[i] holds "catalyst tokens" at connection i
+  - On each step, we spread tokens to neighbors within 'hop' cells
+  - We return a list of (src_idx, dst_idx, share) for UI edges
+"""
+
 from __future__ import annotations
+from dataclasses import dataclass
 import numpy as np
 
+
+@dataclass
+class CatalystConfig:
+    beta: float = 0.5          # growth factor
+    lam: float = 0.1           # decay rate per step
+    speed_cells_per_step: int = 1  # hop radius
+
+
 class CatalystTokens:
-    """Lightweight token field on a 1D grid for demo."""
-    def __init__(self, size: int, lam: float, hop: int):
-        self.size = size
-        self.decay = lam
-        self.hop = hop
-        self.field = np.zeros(size, dtype=float)
+    def __init__(self, size: int, cfg: CatalystConfig):
+        self.size = int(size)
+        self.cfg = cfg
+        self.field = np.zeros(self.size, dtype=float)
 
-    def emit(self, idx: int, energy_drop: float, beta: float):
-        self.field[idx] += beta * energy_drop
+    def seed(self, idx: int, amount: float):
+        if 0 <= idx < self.size:
+            self.field[idx] += float(amount)
 
-    def step(self):
-        # finite-speed spread (hop cells left/right), then decay
+    def step_with_transfers(self) -> list[tuple[int, int, float]]:
+        """Spread locally; return list of transfers for edge logging."""
+        hop = max(0, int(self.cfg.speed_cells_per_step))
+        if hop == 0:
+            # no spread, just decay/growth
+            self.field = (1.0 - self.cfg.lam) * (self.field * (1.0 + self.cfg.beta))
+            return []
+
+        transfers: list[tuple[int, int, float]] = []
         new = np.zeros_like(self.field)
+
         for i, val in enumerate(self.field):
-            if val == 0: continue
-            L = max(0, i - self.hop); R = min(self.size-1, i + self.hop)
-            share = val / (R-L+1)
-            new[L:R+1] += share
-        self.field = new * (1.0 - self.decay)
+            if val <= 0.0:
+                continue
+            L = max(0, i - hop)
+            R = min(self.size - 1, i + hop)
+            span = R - L + 1
+            share = val / span
+            for j in range(L, R + 1):
+                new[j] += share
+                transfers.append((i, j, float(share)))
 
-
-def apply_catalyst_effects(theta_thr: float, T_eff: float, cat_val: float,
-                           zeta: float=0.05, epsT: float=0.05):
-    theta_new = max(0.0, theta_thr * (1.0 - zeta*cat_val))
-    T_new = max(1e-6, T_eff * (1.0 - epsT*cat_val))
-    return theta_new, T_new
+        # simple growth/decay on the moved mass
+        new = (1.0 - self.cfg.lam) * (new * (1.0 + self.cfg.beta))
+        self.field = new
+        return transfers
