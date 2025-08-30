@@ -1,5 +1,7 @@
 # analytics/streamlit_app.py
-import os, json, urllib.request
+import os
+import json
+import urllib.request
 from typing import Dict, List
 
 import duckdb as ddb
@@ -20,7 +22,7 @@ DATA_URL_PREFIX = st.secrets.get(
 )
 st.caption(f"📦 Using DATA_URL_PREFIX = {DATA_URL_PREFIX}")
 
-# Allow quick override from the UI
+# Allow quick override from the UI (handy for testing another bucket)
 prefix = st.text_input("Bucket URL prefix", DATA_URL_PREFIX)
 
 # Single DuckDB connection
@@ -29,7 +31,7 @@ con = ddb.connect()
 # ----------------------------
 # Helpers
 # ----------------------------
-def _http_get_json(url: str, timeout: float = 6.0):
+def http_get_json(url: str, timeout: float = 6.0):
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.load(r)
 
@@ -51,7 +53,7 @@ def list_runs_via_index(prefix: str) -> List[str]:
     """Fallback: fetch /runs/index.json which lists available run_ids."""
     url = f"{prefix}/runs/index.json"
     try:
-        data = _http_get_json(url)
+        data = http_get_json(url)
         return sorted(data.get("runs", []))
     except Exception:
         return []
@@ -73,9 +75,9 @@ def count_shards_best_effort(prefix: str, run_id: str) -> Dict[str, int]:
 def load_event_files_from_index(prefix: str, run_id: str) -> List[str]:
     """Read shards_index.json to get explicit HTTPS URLs of event shards."""
     url = f"{prefix}/runs/{run_id}/shards/shards_index.json"
-    data = _http_get_json(url)  # raises if missing
+    data = http_get_json(url)  # raises if missing or not public
     files = data.get("files", [])
-    # Basic sanity filter
+    # basic sanity
     return [u for u in files if u.endswith(".parquet")]
 
 # ----------------------------
@@ -112,15 +114,21 @@ st.subheader("Diagnostics")
 colA, colB = st.columns([2, 1], vertical_alignment="top")
 
 with colA:
-    step_min = st.number_input("Step min", 0, value=0)
-    step_max = st.number_input("Step max", 1_000_000, value=5_000)
+    # Step window inputs (correct keyword args)
+    step_min = st.number_input("Step min", min_value=0, value=0, step=100)
+    step_max = st.number_input(
+        "Step max",
+        min_value=step_min,
+        value=max(step_min + 100, 5_000),
+        step=100
+    )
 
-    # Show intended wildcard pattern (for reference only)
+    # Reference wildcard pattern (for your info only; not used for reads)
     events_pattern = f"{prefix}/runs/{run_id}/shards/events_*.parquet" if run_id else ""
     st.text_area("Reference (wildcard) events pattern", events_pattern, height=60)
 
 with colB:
-    # Test access to first listed file from the shard index
+    # Test access: read first file listed in shards_index.json
     if run_id and st.button("Test access via shard index"):
         try:
             files = load_event_files_from_index(prefix, run_id)
@@ -137,7 +145,7 @@ with colB:
             st.error(f"Index test failed:\n{e}")
 
 # ----------------------------
-# Load & visualize events (index-based)
+# Load & visualize events (index-based, no HTTPS wildcards)
 # ----------------------------
 st.divider()
 st.subheader("Events in step window")
@@ -157,7 +165,7 @@ if run_id and st.button("Load events"):
         st.warning("No event shards listed in shards_index.json yet.")
         st.stop()
 
-    # 2) Read all listed event shards (no wildcards over HTTPS)
+    # 2) Read all listed event shards (pass the list; no wildcards)
     try:
         df = con.execute(
             """
