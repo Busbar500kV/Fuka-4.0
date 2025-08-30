@@ -1,5 +1,6 @@
-numpy
-scipy
-pandas
-pyarrow
-duckdb
+numpy>=1.26
+duckdb>=1.0
+pandas>=2.2
+pyarrow>=14
+plotly>=5.22.0
+streamlit>=1.36
