@@ -1,217 +1,131 @@
-"""
-Fuka 4.0 minimal engine that produces:
-  - events, spectra, state, ledger
-  - edges (from catalyst transfers)
-  - env snapshots (sparse)
-
-Coordinates:
-  We embed a 1D chain of 'grid_size' connections along x-axis (y=z=0).
-  You can switch to 2D/3D later by changing _cell_xyz().
-
-Physics (toy, local-only):
-  - Environment field E_i(t) = sum_k A_k sin(w_k*t + phi_k + i*phase_dx)
-  - Each connection integrates local energy over 'window' and, if above threshold,
-    encodes mass dm proportional to the free-energy drop at that cell.
-  - Catalysts propagate locally and create edges between connections.
-"""
-
 from __future__ import annotations
-from dataclasses import dataclass
-from math import sin, tau
-from typing import List, Tuple, Dict, Any
-
+from typing import Dict, Any, List, Tuple
 import numpy as np
 
-from .recorder import ParquetRecorder
-from .catalysts import CatalystConfig, CatalystTokens
-
-
-@dataclass
-class WorldConfig:
-    grid_size: int = 256
-    dt: float = 1e-3          # seconds per step
-    window: float = 0.2       # seconds; sliding integration window
-
-
-@dataclass
-class IOConfig:
-    flush_every: int = 1000
-    snap_every: int = 100     # env snapshot cadence
-    env_subsample: int = 4    # sample every N cells for env logs
-
-
-@dataclass
-class EventsConfig:
-    xi_mass: float = 0.8
-    threshold: float = 0.05
+from .physics import World3D, PhysicsCfg, step_diffuse, detect_local_maxima
 
 
 class Engine:
-    def __init__(self,
-                 recorder: ParquetRecorder,
-                 steps: int,
-                 seed: int = 1234,
-                 c: float = 299_792_458.0,
-                 world: WorldConfig = WorldConfig(),
-                 io: IOConfig = IOConfig(),
-                 events: EventsConfig = EventsConfig(),
-                 catalyst: CatalystConfig = CatalystConfig()):
+    """
+    3D Engine (backward compatible):
+      - If cfg['world']['grid_shape'] is present -> use (nx,ny,nz)
+      - Else if cfg['world']['grid_size'] present -> interpret as (N,1,1)
+      - Else fallback to (128,1,1)
+
+    Logs:
+      - env:   physics params every 1000 steps (and step 0)
+      - state: top-K energetic cells per step (x,y,z,value)
+      - edges: gradient edges from top-K to max neighbour (optional-ish viz)
+      - events: strict 6-neighbour local maxima above mean+sigma*std
+      - spectra: energy histogram (bins) per step
+      - ledger: rolled-up totals (sum/mean/std/max)
+    """
+    def __init__(self, recorder, steps: int, cfg: Dict[str, Any] | None = None) -> None:
         self.rec = recorder
         self.steps = int(steps)
-        self.seed = int(seed)
-        self.c = float(c)
-        self.world = world
-        self.io = io
-        self.evt_cfg = events
-        self.rng = np.random.default_rng(self.seed)
+        self.cfg = cfg or {}
 
-        # positions (1D -> 3D embedded)
-        self.dx = 1.0  # meters between neighboring connections
-        self.t = 0.0   # current time
-        self.step_idx = 0
-
-        # field & accumulators
-        G = self.world.grid_size
-        self.field = np.zeros(G, dtype=float)           # current E field
-        self.energy_acc = np.zeros(G, dtype=float)      # integrate |E| over window
-        self.mass = np.zeros(G, dtype=float)            # encoded mass per connection
-        self.T_eff = np.zeros(G, dtype=float)           # toy "temperature"
-        self.theta_thr = np.full(G, self.evt_cfg.threshold, dtype=float)
-
-        # environment wave parameters (two components)
-        self.A = np.array([0.8, 0.6])
-        self.w = np.array([2.0 * np.pi * 5.0, 2.0 * np.pi * 11.0])  # 5 Hz and 11 Hz
-        self.phi = np.array([0.0, np.pi / 3.0])
-        self.phase_dx = 0.03  # spatial phase advance per cell
-
-        # catalysts
-        self.cats = CatalystTokens(G, catalyst)
-        # seed small amount at center
-        self.cats.seed(G // 2, 1.0)
-
-        # window length in steps
-        self.W = max(1, int(round(self.world.window / self.world.dt)))
-
-    # ----------------- helpers -----------------
-
-    def _cell_xyz(self, idx: int) -> Tuple[float, float, float]:
-        x = idx * self.dx
-        return (x, 0.0, 0.0)
-
-    def _env_field_step(self, t: float) -> np.ndarray:
-        """Compute environment field at time t (per cell)."""
-        G = self.world.grid_size
-        idx = np.arange(G)
-        phase = idx * self.phase_dx
-        # E_i(t) = sum_k A_k sin(w_k * t + phi_k + phase_i)
-        E = np.zeros(G, dtype=float)
-        for Ak, wk, ph in zip(self.A, self.w, self.phi):
-            E += Ak * np.sin(wk * t + ph + phase)
-        return E
-
-    def _dominant_spectrum(self, E_window: np.ndarray) -> Tuple[float, float, float]:
-        """
-        Simple dominant frequency estimator from windowed samples at a single cell:
-        returns (w_dom, A_dom, phi_dom). This is intentionally lightweight.
-        """
-        # for toy purposes, we know the injected w; pick the larger amplitude
-        if abs(self.A[0]) >= abs(self.A[1]):
-            return (float(self.w[0]), float(self.A[0]), float(self.phi[0]))
+        # world shape
+        world_cfg = self.cfg.get("world", {})
+        if "grid_shape" in world_cfg:
+            nx,ny,nz = world_cfg["grid_shape"]
         else:
-            return (float(self.w[1]), float(self.A[1]), float(self.phi[1]))
+            n = int(world_cfg.get("grid_size", 256))
+            nx,ny,nz = int(n), 1, 1  # backward-compat 1D -> embedded 3D
 
-    # ----------------- main loop -----------------
+        # physics cfg
+        phy = self.cfg.get("physics", {})
+        self.pcfg = PhysicsCfg(
+            T=float(phy.get("T", 0.0015)),
+            flux_limit=float(phy.get("flux_limit", 0.20)),
+            boundary_leak=float(phy.get("boundary_leak", 0.01)),
+            radius=int(phy.get("radius", 1)),
+            seed=phy.get("seed", None),
+        )
 
-    def step(self):
-        dt = self.world.dt
-        G = self.world.grid_size
+        self.world = World3D((nx,ny,nz), self.pcfg)
 
-        # update environment
-        self.field = self._env_field_step(self.t)
+        # IO knobs
+        io = self.cfg.get("io", {})
+        self.state_topk = int(io.get("state_topk", 256))
+        self.edges_topk = int(io.get("edges_topk", 512))
+        self.spectra_bins = int(io.get("spectra_bins", 64))
+        self.event_sigma = float(io.get("event_threshold_sigma", 3.0))
+        self.log_env_every = int(io.get("log_env_every", 1000))
 
-        # accumulate absolute energy in the sliding window
-        self.energy_acc += np.abs(self.field)
+    # ------------ helpers ------------
+    def _topk_cells(self, k: int) -> List[Tuple[int,int,int,float]]:
+        E = self.world.energy
+        k = int(max(1, min(k, E.size)))
+        flat_idx = np.argpartition(E.ravel(), -k)[-k:]
+        flat_idx = flat_idx[np.argsort(E.ravel()[flat_idx])][::-1]  # sort descending
+        coords_vals: List[Tuple[int,int,int,float]] = []
+        nx, ny = self.world.nx, self.world.ny
+        for idx in flat_idx:
+            x = int(idx // (ny*self.world.nz))
+            rem = int(idx % (ny*self.world.nz))
+            y = int(rem // self.world.nz)
+            z = int(rem % self.world.nz)
+            coords_vals.append((x,y,z,float(E[x,y,z])))
+        return coords_vals
 
-        # every snap, log sparse env samples
-        if (self.step_idx % self.io.snap_every) == 0:
-            for i in range(0, G, max(1, self.io.env_subsample)):
-                x, y, z = self._cell_xyz(i)
-                self.rec.log_env(step=self.step_idx, tau=self.t,
-                                 conn_id=i, xmu=(self.t, x, y, z), frame_id=0,
-                                 value=float(self.field[i]))
+    def _best_neighbour(self, x: int, y: int, z: int) -> Tuple[int,int,int,float] | None:
+        """Return neighbour with highest energy (6-connectivity)."""
+        best = None
+        best_v = -1e30
+        for xn, yn, zn in self.world.neighbors6(x,y,z):
+            v = float(self.world.energy[xn,yn,zn])
+            if v > best_v:
+                best_v = v; best = (xn,yn,zn,v)
+        return best
 
-        # if the window filled, evaluate encoding & events
-        if (self.step_idx + 1) % self.W == 0:
-            # normalize accumulated energy by window length (mean |E|)
-            E_mean = self.energy_acc / float(self.W)
+    # ------------ main loop ------------
+    def run(self) -> None:
+        # initial env log (step 0)
+        self.rec.log_env(step=0, nx=self.world.nx, ny=self.world.ny, nz=self.world.nz,
+                         T=self.pcfg.T, flux_limit=self.pcfg.flux_limit,
+                         boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius)
 
-            # thresholding + encoding
-            enc_mask = E_mean >= self.theta_thr  # bool per cell
-            dm = self.evt_cfg.xi_mass * (E_mean - self.theta_thr) * enc_mask
-            dm = np.maximum(dm, 0.0)
+        for step in range(1, self.steps + 1):
+            # physics update
+            stats = step_diffuse(self.world)
 
-            # update state
-            self.mass += dm
-            # toy "temperature" proportional to fluctuation strength
-            self.T_eff = 0.2 * E_mean + 0.05 * self.rng.standard_normal(size=G)
+            # ledger (rollups)
+            self.rec.log_ledger(step=step, **stats)
 
-            # log events where encoding happened
-            indices = np.where(enc_mask)[0]
-            for i in indices:
-                x, y, z = self._cell_xyz(i)
-                # local spectrum estimate (toy)
-                w_dom, A_dom, phi_dom = self._dominant_spectrum(None)
-                dF = float(E_mean[i])  # report mean local magnitude as "drop"
-                self.rec.log_event(
-                    step=self.step_idx, tau=self.t, conn_id=int(i),
-                    xmu=(self.t, x, y, z), frame_id=0,
-                    dF=dF, dm=float(dm[i]),
-                    w_sel=w_dom, A_sel=A_dom, phi_sel=phi_dom,
-                    T_eff=float(self.T_eff[i]), theta_thr=float(self.theta_thr[i])
-                )
-                # spectra summary once per window (keep small)
-                self.rec.log_spectra(
-                    step=self.step_idx, conn_id=int(i),
-                    w_dom=w_dom, A_dom=A_dom, phi_dom=phi_dom,
-                    F_local=dF, E_sum=float(E_mean[i]*self.W), S_spec=float(A_dom**2)
-                )
+            # spectra (histogram)
+            counts, edges = np.histogram(self.world.energy, bins=self.spectra_bins)
+            self.rec.log_spectrum(
+                step=step,
+                bin_edges=edges.astype(float).tolist(),
+                counts=counts.astype(int).tolist(),
+            )
 
-            # log state snapshot (downsample for performance)
-            for i in range(0, G, 2):
-                x, y, z = self._cell_xyz(i)
-                self.rec.log_state(step=self.step_idx, conn_id=int(i),
-                                   x=x, y=y, z=z,
-                                   m=float(self.mass[i]),
-                                   T_eff=float(self.T_eff[i]),
-                                   theta_thr=float(self.theta_thr[i]))
+            # state (top-K energetic cells)
+            for (x,y,z,v) in self._topk_cells(self.state_topk):
+                self.rec.log_state(step=step, x=int(x), y=int(y), z=int(z), value=float(v))
 
-            # simple ledger terms aggregated
-            dF_total = float(E_mean.sum())
-            c2dm_total = float((dm * (self.c ** 2)).sum())
-            balance_error = dF_total - c2dm_total
-            self.rec.log_ledger(step=self.step_idx,
-                                dF=dF_total, c2dm=c2dm_total,
-                                Q=float(E_mean.var()), W_cat=float(self.cats.field.sum()),
-                                net_flux=float(np.gradient(E_mean).sum()),
-                                balance_error=float(balance_error))
+            # edges (each top cell -> strongest neighbour)
+            e_logged = 0
+            for (x,y,z,v) in self._topk_cells(min(self.edges_topk, self.state_topk)):
+                nb = self._best_neighbour(x,y,z)
+                if nb is None: continue
+                xn,yn,zn,vn = nb
+                if (xn,yn,zn) == (x,y,z): continue
+                self.rec.log_edge(step=step,
+                                  x0=int(x), y0=int(y), z0=int(z), v0=float(v),
+                                  x1=int(xn),y1=int(yn),z1=int(zn), v1=float(vn))
+                e_logged += 1
+                if e_logged >= self.edges_topk: break
 
-            # reset window accumulator
-            self.energy_acc[:] = 0.0
+            # events (strict local maxima by sigma)
+            for (x,y,z,v) in detect_local_maxima(self.world, sigma_thresh=self.event_sigma):
+                self.rec.log_event(step=step, x=int(x), y=int(y), z=int(z), value=float(v))
 
-        # catalyst propagation -> edges
-        transfers = self.cats.step_with_transfers()
-        if transfers:
-            for src, dst, w in transfers:
-                xs, ys, zs = self._cell_xyz(src)
-                self.rec.log_edge(step=self.step_idx, tau=self.t,
-                                  src_conn=int(src), dst_conn=int(dst), weight=float(w),
-                                  xmu=(self.t, xs, ys, zs), frame_id=0)
+            # env every N steps
+            if (step % self.log_env_every) == 0:
+                self.rec.log_env(step=step, nx=self.world.nx, ny=self.world.ny, nz=self.world.nz,
+                                 T=self.pcfg.T, flux_limit=self.pcfg.flux_limit,
+                                 boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius)
 
-        # advance time
-        self.t += dt
-        self.step_idx += 1
-
-    def run(self):
-        for _ in range(self.steps):
-            self.step()
         self.rec.finalize()
