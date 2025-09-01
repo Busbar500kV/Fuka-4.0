@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Dict
 from .engine import Engine
-from .recorder import Recorder
+from .recorder import ParquetRecorder as Recorder
 from .catalog import update_catalog
 
 def run_headless(config_path: str, data_root: str):
