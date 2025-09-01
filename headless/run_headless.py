@@ -1,4 +1,4 @@
-# headless.py
+# run_headless.py
 import argparse, os
 from pathlib import Path
 from fuka.runner import run_headless
