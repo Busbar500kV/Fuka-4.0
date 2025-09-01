@@ -21,3 +21,7 @@ def run_headless(config_path: str, data_root: str):
     # update catalog
     update_catalog(Path(data_root) / "catalog.duckdb",
                    Path(data_root) / "runs" / run_id)
+                
+            # At the end of fuka/recorder.py
+Recorder = ParquetRecorder
+__all__ = ["ParquetRecorder", "Recorder"]
