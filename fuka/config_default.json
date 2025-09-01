@@ -1,23 +1,39 @@
 {
-  "run_name": "FUKA_4_0_DEMO",
-  "steps": 5000,
-  "seed": 1234,
-  "c": 299792458.0,
-  "io": {
-    "flush_every": 1000
-  },
+  "run_name": "FUKA_4_0_3D",
+  "steps": 3000,
+
   "world": {
-    "grid_size": 256,
-    "dt": 0.001,
-    "window": 1.0
+    "grid_shape": [96, 64, 48]
   },
-  "events": {
-    "xi_mass": 0.8,
-    "threshold": 0.05
+
+  "physics": {
+    "T": 0.0015,
+    "flux_limit": 0.20,
+    "boundary_leak": 0.01,
+    "radius": 1,
+    "seed": 42
   },
-  "catalyst": {
-    "beta": 0.5,
-    "lambda": 0.1,
-    "speed_cells_per_step": 1
+
+  "catalysts": {
+    "enabled": true,
+    "max_count": 256,
+    "spawn_prob_base": 0.08,
+    "strength": 0.75,
+    "radius": 3.0,
+    "decay_per_step": 0.0025,
+    "jitter_std": 0.6,
+    "drift": [0.0, 0.0, 0.0],
+    "reflect_at_boundary": true,
+    "min_strength": 0.05,
+    "deposit_clip": 2.0
+  },
+
+  "io": {
+    "flush_every": 2000,
+    "state_topk": 400,
+    "edges_topk": 800,
+    "spectra_bins": 64,
+    "event_threshold_sigma": 3.0,
+    "log_env_every": 1000
   }
 }
