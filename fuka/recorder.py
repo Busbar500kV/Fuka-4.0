@@ -160,3 +160,5 @@ class ParquetRecorder:
         """Row should contain: step, x, y, z, value, [conn_id optional]."""
         self._buf["env"].append(self._with_common(row))
         self._maybe_flush()
+        
+Recorder = ParquetRecorder
