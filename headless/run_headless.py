@@ -1,14 +1,19 @@
-# headless/run_headless.py
-import argparse, os
+from __future__ import annotations
+import argparse
 from pathlib import Path
 from fuka.runner import run_headless
 
-if __name__ == "__main__":
+
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="fuka/config_default.json")
-    ap.add_argument("--data_root", default="data")
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--data_root", required=True)
     args = ap.parse_args()
 
-    Path(args.data_root).mkdir(parents=True, exist_ok=True)
-    run_headless(args.config, args.data_root)
-    print("Done. Data under:", args.data_root)
+    # expand & resolve
+    cfg = str(Path(args.config).expanduser())
+    dr  = str(Path(args.data_root).expanduser())
+    run_headless(cfg, dr)
+
+if __name__ == "__main__":
+    main()
