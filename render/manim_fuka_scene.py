@@ -1,169 +1,172 @@
 # render/manim_fuka_scene.py
-from __future__ import annotations
-import os, math, colorsys
-from typing import Sequence, Iterable, Dict
-import numpy as np
-from manim import ThreeDScene, Dot3D, Line3D, VGroup
+# Manim scene that reads an NPZ created by fuka.render.pack_npz
+# Schema expected:
+#   steps: (F,)
+#   state_x/state_y/state_z/state_value: (N_state_total,)
+#   state_idx: (F+1,) frame index into state_* (CSR-like)
+#   edges_x0/edges_y0/edges_z0/edges_x1/edges_y1/edges_z1: (N_edge_total,)
+#   edges_idx: (F+1,) frame index into edges_* (CSR-like)
+#
+# Environment knobs (all optional):
+#   FUKA_NPZ=...</path/to.npz>
+#   FUKA_FPS=6
+#   FUKA_STEP_SECONDS=0.2
+#   FUKA_MAX_POINTS=8000
+#   FUKA_MAX_EDGES=8000
+#   FUKA_POINT_RADIUS=0.04 (scene units)
+#   FUKA_EDGE_WIDTH=2.0
+#   FUKA_PAD=0.5  (extra padding around the data bbox)
 
-# ---------- env helpers ----------
+from __future__ import annotations
+import os
+import math
+import numpy as np
+from typing import Tuple
+
+from manim import (
+    ThreeDScene, VGroup, Dot3D, Line3D, Color,
+    ORIGIN, config
+)
+
+# ---------- helpers ----------
+
 def _env_float(name: str, default: float) -> float:
-    try: return float(os.environ.get(name, default))
-    except Exception: return float(default)
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
 
 def _env_int(name: str, default: int) -> int:
-    try: return int(os.environ.get(name, default))
-    except Exception: return int(default)
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return int(default)
 
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.environ.get(name); 
-    if v is None: return default
-    return str(v).strip().lower() in ("1","true","yes","y","on")
+def _load_npz() -> Tuple[np.ndarray, dict]:
+    npz_path = os.environ.get("FUKA_NPZ", "").strip()
+    if not npz_path:
+        raise RuntimeError("FUKA_NPZ not set (path to packed NPZ).")
+    data = np.load(npz_path, allow_pickle=False)
+    # required keys
+    required = [
+        "steps",
+        "state_x","state_y","state_z","state_value","state_idx",
+        "edges_x0","edges_y0","edges_z0","edges_x1","edges_y1","edges_z1","edges_idx",
+    ]
+    missing = [k for k in required if k not in data.files]
+    if missing:
+        raise KeyError(f"NPZ missing required keys: {missing}. Found: {list(data.files)}")
+    return data["steps"], {k: data[k] for k in required if k != "steps"}
 
-# ---------- array helpers ----------
-def _normalize(vals: np.ndarray) -> np.ndarray:
-    if vals.size == 0: return np.zeros_like(vals, dtype=float)
-    vmin = float(np.nanmin(vals)); vmax = float(np.nanmax(vals))
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        return np.zeros_like(vals, dtype=float)
-    out = (vals - vmin) / (vmax - vmin)
-    return np.clip(out, 0.0, 1.0)
+def _value_to_rgb(vals: np.ndarray) -> np.ndarray:
+    """Map scalar values -> RGB in [0,1]. Simple Viridis-like tri-gradient."""
+    if vals.size == 0:
+        return np.zeros((0,3), dtype=float)
+    vmin = float(np.nanmin(vals))
+    vmax = float(np.nanmax(vals))
+    if not math.isfinite(vmin) or not math.isfinite(vmax) or vmax <= vmin:
+        vmax = vmin + 1.0
+    t = (vals - vmin) / (vmax - vmin)
+    # piecewise: blue(0,0,0.5)->green(0,1,0)->yellow(1,1,0)
+    rgb = np.zeros((len(vals),3), dtype=float)
+    # 0..0.5: blue -> green
+    mask1 = t <= 0.5
+    a = np.zeros_like(t)
+    a[mask1] = t[mask1] / 0.5
+    rgb[mask1, 0] = 0.0
+    rgb[mask1, 1] = a[mask1]
+    rgb[mask1, 2] = 0.5 * (1.0 - a[mask1])
+    # 0.5..1: green -> yellow
+    mask2 = ~mask1
+    b = (t[mask2] - 0.5) / 0.5
+    rgb[mask2, 0] = b
+    rgb[mask2, 1] = 1.0
+    rgb[mask2, 2] = 0.0
+    return np.clip(rgb, 0.0, 1.0)
 
-def _value_to_rgb_triplets(vals: np.ndarray) -> np.ndarray:
-    """Scalar in [0,1] -> RGB (blue→red) via HSV; returns (N,3) floats."""
-    v = np.clip(vals.astype(float), 0.0, 1.0)
-    hues = 0.66 * (1.0 - v)
-    rgbs = np.empty((v.shape[0], 3), dtype=float)
-    for i, h in enumerate(hues):
-        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
-        rgbs[i] = (r, g, b)
-    return rgbs
-
-def _thin_indices(n: int, k: int) -> np.ndarray:
-    if n <= k: return np.arange(n, dtype=np.int64)
-    stride = max(1, n // k)
-    return np.arange(0, n, stride, dtype=np.int64)[:k]
-
-def _pick(npz: Dict[str, np.ndarray], *names: str, required: bool = True) -> np.ndarray:
-    """Pick the first existing array from a list of names, else raise with debug info."""
-    for n in names:
-        if n in npz: return npz[n]
-    if required:
-        raise KeyError(f"None of {names} found in NPZ. Available keys: {list(npz.files)}")
-    return np.array([])
+def _downsample(n: int, max_n: int) -> np.ndarray:
+    if n <= max_n:
+        return np.arange(n, dtype=int)
+    # uniform stride
+    stride = max(1, n // max_n)
+    idx = np.arange(0, n, stride, dtype=int)
+    if idx.size > max_n:
+        idx = idx[:max_n]
+    return idx
 
 # ---------- Scene ----------
+
 class FukaWorldEdges3D(ThreeDScene):
-    """
-    Robust loader for NPZ produced by pack_npz, tolerating different key names.
-    Expected any of the following (first match wins):
-
-      steps:            'steps' | 'frame_steps' | 'unique_steps'
-
-      state step:       'state_step' | 'state_steps' | 's_step'
-      state x:          'state_x' | 'sx' | 'x'
-      state y:          'state_y' | 'sy' | 'y'
-      state z:          'state_z' | 'sz' | 'z'
-      state value:      'state_value' | 'value' | 'm' | 'val'
-
-      edges step:       'edges_step' | 'edge_step' | 'e_step'
-      edges x0..z1:     'x0','y0','z0','x1','y1','z1' (or legacy 'xs','ys','zs' + dst coords not supported)
-
-      Optional weights: 'v0','v1' (falls back to zeros if absent)
-    """
     def construct(self):
-        npz_path = os.environ.get("FUKA_NPZ", "").strip()
-        if not npz_path or not os.path.isfile(npz_path):
-            raise FileNotFoundError(f"FUKA_NPZ not set or file not found: {npz_path}")
+        # env knobs
+        fps = _env_int("FUKA_FPS", 6)
+        step_secs = _env_float("FUKA_STEP_SECONDS", 0.2)
+        max_points = _env_int("FUKA_MAX_POINTS", 8000)
+        max_edges  = _env_int("FUKA_MAX_EDGES", 8000)
+        point_radius = _env_float("FUKA_POINT_RADIUS", 0.04)
+        edge_width   = _env_float("FUKA_EDGE_WIDTH", 2.0)
+        pad          = _env_float("FUKA_PAD", 0.5)
 
-        step_seconds = _env_float("FUKA_STEP_SECONDS", 0.20)
-        max_points   = _env_int("FUKA_MAX_POINTS",   80000)
-        max_edges    = _env_int("FUKA_MAX_EDGES",    20000)
-        point_radius = _env_float("FUKA_POINT_RADIUS", 0.035)
-        edge_width   = _env_float("FUKA_EDGE_WIDTH",   2.5)
-        show_edges   = _env_bool ("FUKA_SHOW_EDGES",   True)
+        # apply FPS from env (also set via CLI in wrapper)
+        config.frame_rate = fps
 
-        # Camera
-        self.set_camera_orientation(phi=65*math.pi/180, theta=45*math.pi/180)
+        steps, D = _load_npz()
+        # state arrays
+        sx, sy, sz = D["state_x"], D["state_y"], D["state_z"]
+        sv = D["state_value"]; sidx = D["state_idx"]
+        # edges arrays
+        ex0, ey0, ez0 = D["edges_x0"], D["edges_y0"], D["edges_z0"]
+        ex1, ey1, ez1 = D["edges_x1"], D["edges_y1"], D["edges_z1"]
+        eidx = D["edges_idx"]
 
-        data = np.load(npz_path, allow_pickle=False)
+        # global bbox (for camera frame / padding)
+        if sx.size:
+            xmin, xmax = float(np.min(sx)), float(np.max(sx))
+            ymin, ymax = float(np.min(sy)), float(np.max(sy))
+            zmin, zmax = float(np.min(sz)), float(np.max(sz))
+        else:
+            xmin = ymin = zmin = -1.0
+            xmax = ymax = zmax =  1.0
+        xrange = xmax - xmin; yrange = ymax - ymin; zrange = zmax - zmin
+        xmin -= pad * xrange; xmax += pad * xrange
+        ymin -= pad * yrange; ymax += pad * yrange
+        zmin -= pad * zrange; zmax += pad * zrange
+        # basic camera setup
+        self.set_camera_orientation(phi=70*math.pi/180, theta=45*math.pi/180, zoom=1.0)
+        self.camera.frame.move_to(((xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2))
 
-        # steps (global ordered)
-        steps = _pick(data, "steps", "frame_steps", "unique_steps").astype(np.int64)
+        # iterate frames
+        F = int(steps.shape[0])
+        for fi in range(F):
+            # state slice
+            s_lo = int(sidx[fi]); s_hi = int(sidx[fi+1])
+            n_s = max(0, s_hi - s_lo)
+            pts_group = VGroup()
+            if n_s > 0:
+                si = _downsample(n_s, max_points) + s_lo
+                xs, ys, zs = sx[si], sy[si], sz[si]
+                vals = sv[si]
+                cols = _value_to_rgb(vals)
 
-        # state
-        s_step = _pick(data, "state_step", "state_steps", "s_step").astype(np.int64)
-        sx     = _pick(data, "state_x", "sx", "x").astype(float)
-        sy     = _pick(data, "state_y", "sy", "y").astype(float)
-        sz     = _pick(data, "state_z", "sz", "z").astype(float)
-        # value can be named a few ways
-        sv     = _pick(data, "state_value", "value", "m", "val").astype(float)
-
-        # edges
-        e_step = _pick(data, "edges_step", "edge_step", "e_step").astype(np.int64)
-        x0 = _pick(data, "x0").astype(float)
-        y0 = _pick(data, "y0").astype(float)
-        z0 = _pick(data, "z0").astype(float)
-        x1 = _pick(data, "x1").astype(float)
-        y1 = _pick(data, "y1").astype(float)
-        z1 = _pick(data, "z1").astype(float)
-        v0 = _pick(data, "v0", required=False).astype(float) if "v0" in data else np.zeros_like(x0)
-        # v1 optional, unused for color; keep shape check
-        _ =  _pick(data, "v1", required=False)
-
-        # global normalization for consistent colors across frames
-        svn = _normalize(sv)
-        v0n = _normalize(v0)
-
-        # per-step indices
-        from collections import defaultdict
-        idx_state = defaultdict(list)
-        for i, st in enumerate(s_step): idx_state[int(st)].append(i)
-        idx_edges = defaultdict(list)
-        for i, st in enumerate(e_step): idx_edges[int(st)].append(i)
-
-        cur = VGroup()
-
-        for st in steps:
-            st = int(st)
-            # clear previous frame content
-            self.clear()
-            self.remove(cur)
-
-            pts = VGroup(); seg = VGroup()
-
-            # points
-            sidx = np.array(idx_state.get(st, []), dtype=np.int64)
-            if sidx.size:
-                sidx = _thin_indices(int(sidx.size), max_points)
-                xs, ys, zs = sx[sidx], sy[sidx], sz[sidx]
-                cols = _value_to_rgb_triplets(svn[sidx])
                 for j in range(xs.shape[0]):
-                    d = Dot3D(point=(float(xs[j]), float(ys[j]), float(zs[j])))
-                    rgb = tuple(map(float, cols[j]))
-                    d.set_fill(rgb, opacity=1.0)
-                    d.set_stroke(rgb, width=0.0, opacity=0.0)
-                    d.radius = point_radius
-                    pts.add(d)
+                    d = Dot3D(point=(float(xs[j]), float(ys[j]), float(zs[j])), radius=point_radius)
+                    c = Color(rgb=(float(cols[j,0]), float(cols[j,1]), float(cols[j,2])))
+                    d.set_fill(c, opacity=1.0).set_stroke(c, opacity=1.0, width=0.0)
+                    pts_group.add(d)
 
-            # edges
-            if show_edges:
-                eidx = np.array(idx_edges.get(st, []), dtype=np.int64)
-                if eidx.size:
-                    eidx = _thin_indices(int(eidx.size), max_edges)
-                    x0s, y0s, z0s = x0[eidx], y0[eidx], z0[eidx]
-                    x1s, y1s, z1s = x1[eidx], y1[eidx], z1[eidx]
-                    cols = _value_to_rgb_triplets(v0n[eidx])
-                    for j in range(x0s.shape[0]):
-                        line = Line3D(
-                            start=(float(x0s[j]), float(y0s[j]), float(z0s[j])),
-                            end  =(float(x1s[j]), float(y1s[j]), float(z1s[j]))
-                        )
-                        rgb = tuple(map(float, cols[j]))
-                        line.set_stroke(rgb, width=edge_width)
-                        seg.add(line)
+            # edges slice
+            e_lo = int(eidx[fi]); e_hi = int(eidx[fi+1])
+            n_e = max(0, e_hi - e_lo)
+            edges_group = VGroup()
+            if n_e > 0:
+                ei = _downsample(n_e, max_edges) + e_lo
+                for j in ei:
+                    p0 = (float(ex0[j]), float(ey0[j]), float(ez0[j]))
+                    p1 = (float(ex1[j]), float(ey1[j]), float(ez1[j]))
+                    seg = Line3D(p0, p1, stroke_width=edge_width, stroke_opacity=0.85)
+                    edges_group.add(seg)
 
-            cur = VGroup(pts, seg)
-            self.add(cur)
-            self.wait(step_seconds)
-
-        self.wait(0.1)
+            frame_group = VGroup(edges_group, pts_group)
+            self.add(frame_group)
+            self.wait(step_secs)
+            self.remove(frame_group)
