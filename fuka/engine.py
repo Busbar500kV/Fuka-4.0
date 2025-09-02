@@ -2,23 +2,27 @@ from __future__ import annotations
 from typing import Dict, Any, List, Tuple
 import numpy as np
 
-from .physics import World3D, PhysicsCfg, step_diffuse, detect_local_maxima
+from .physics import (
+    World3D, PhysicsCfg, step_diffuse, detect_local_maxima,
+    CatalystsCfg, CatalystsSystem
+)
 
 
 class Engine:
     """
     3D Engine (backward compatible):
-      - If cfg['world']['grid_shape'] is present -> use (nx,ny,nz)
+      - If cfg['world']['grid_shape'] present -> use (nx,ny,nz)
       - Else if cfg['world']['grid_size'] present -> interpret as (N,1,1)
       - Else fallback to (128,1,1)
 
-    Logs:
-      - env:   physics params every 1000 steps (and step 0)
-      - state: top-K energetic cells per step (x,y,z,value)
-      - edges: gradient edges from top-K to max neighbour (optional-ish viz)
-      - events: strict 6-neighbour local maxima above mean+sigma*std
-      - spectra: energy histogram (bins) per step
-      - ledger: rolled-up totals (sum/mean/std/max)
+    Logs each step:
+      - ledger: sum/mean/std/max of energy (+ catalyst totals)
+      - spectra: histogram (counts + bin_edges)
+      - state: top-K cells by energy (x,y,z,value)
+      - edges: gradient edge to strongest 6-neighbour (subset of top-K)
+      - events: strict 6-neighbour local maxima above mean + sigma*std
+      - env: world + physics params (every N steps and at step 0)
+      - catalysts: (cid,x,y,z,strength)
     """
     def __init__(self, recorder, steps: int, cfg: Dict[str, Any] | None = None) -> None:
         self.rec = recorder
@@ -44,6 +48,23 @@ class Engine:
         )
 
         self.world = World3D((nx,ny,nz), self.pcfg)
+
+        # catalysts cfg
+        cat_cfg = self.cfg.get("catalysts", {})
+        self.ccfg = CatalystsCfg(
+            enabled=bool(cat_cfg.get("enabled", True)),
+            max_count=int(cat_cfg.get("max_count", 256)),
+            spawn_prob_base=float(cat_cfg.get("spawn_prob_base", 0.08)),
+            strength=float(cat_cfg.get("strength", 0.75)),
+            radius=float(cat_cfg.get("radius", 3.0)),
+            decay_per_step=float(cat_cfg.get("decay_per_step", 0.0025)),
+            jitter_std=float(cat_cfg.get("jitter_std", 0.6)),
+            drift=tuple(cat_cfg.get("drift", (0.0,0.0,0.0))),
+            reflect_at_boundary=bool(cat_cfg.get("reflect_at_boundary", True)),
+            min_strength=float(cat_cfg.get("min_strength", 0.05)),
+            deposit_clip=float(cat_cfg.get("deposit_clip", 2.0)),
+        )
+        self.catalysts = CatalystsSystem(self.world, self.ccfg)
 
         # IO knobs
         io = self.cfg.get("io", {})
@@ -84,14 +105,22 @@ class Engine:
         # initial env log (step 0)
         self.rec.log_env(step=0, nx=self.world.nx, ny=self.world.ny, nz=self.world.nz,
                          T=self.pcfg.T, flux_limit=self.pcfg.flux_limit,
-                         boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius)
+                         boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius,
+                         catalysts_enabled=int(self.ccfg.enabled))
 
         for step in range(1, self.steps + 1):
-            # physics update
+            # background field update
             stats = step_diffuse(self.world)
 
+            # catalysts update + deposit
+            cat_totals = {"spawned": 0, "alive": 0, "total_deposit": 0.0}
+            if self.ccfg.enabled:
+                cat_totals = self.catalysts.update()
+
             # ledger (rollups)
-            self.rec.log_ledger(step=step, **stats)
+            self.rec.log_ledger(step=step, **stats, cat_alive=int(cat_totals["alive"]),
+                                cat_spawned=int(cat_totals["spawned"]),
+                                cat_deposit=float(cat_totals["total_deposit"]))
 
             # spectra (histogram)
             counts, edges = np.histogram(self.world.energy, bins=self.spectra_bins)
@@ -101,13 +130,21 @@ class Engine:
                 counts=counts.astype(int).tolist(),
             )
 
+            # catalysts (positions/strengths)
+            if self.ccfg.enabled and self.catalysts.pos:
+                for cid, (p, s) in enumerate(zip(self.catalysts.pos, self.catalysts.strength)):
+                    self.rec.log_catalyst(step=step, cid=int(cid),
+                                          x=float(p[0]), y=float(p[1]), z=float(p[2]),
+                                          strength=float(s))
+
             # state (top-K energetic cells)
-            for (x,y,z,v) in self._topk_cells(self.state_topk):
+            top_state = self._topk_cells(self.state_topk)
+            for (x,y,z,v) in top_state:
                 self.rec.log_state(step=step, x=int(x), y=int(y), z=int(z), value=float(v))
 
             # edges (each top cell -> strongest neighbour)
             e_logged = 0
-            for (x,y,z,v) in self._topk_cells(min(self.edges_topk, self.state_topk)):
+            for (x,y,z,v) in top_state[:min(self.edges_topk, len(top_state))]:
                 nb = self._best_neighbour(x,y,z)
                 if nb is None: continue
                 xn,yn,zn,vn = nb
@@ -122,10 +159,11 @@ class Engine:
             for (x,y,z,v) in detect_local_maxima(self.world, sigma_thresh=self.event_sigma):
                 self.rec.log_event(step=step, x=int(x), y=int(y), z=int(z), value=float(v))
 
-            # env every N steps
+            # env periodic
             if (step % self.log_env_every) == 0:
                 self.rec.log_env(step=step, nx=self.world.nx, ny=self.world.ny, nz=self.world.nz,
                                  T=self.pcfg.T, flux_limit=self.pcfg.flux_limit,
-                                 boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius)
+                                 boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius,
+                                 catalysts_enabled=int(self.ccfg.enabled))
 
         self.rec.finalize()
