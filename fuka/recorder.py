@@ -7,7 +7,8 @@ import pandas as pd
 import time
 import json
 
-TABLES = ("events", "spectra", "state", "ledger", "edges", "env")
+# Added "catalysts" table
+TABLES = ("events", "spectra", "state", "ledger", "edges", "env", "catalysts")
 
 
 @dataclass
@@ -16,7 +17,7 @@ class ParquetRecorder:
     Writes table buffers to Parquet shards under:
         <data_root>/<run_id>/shards/<table>_000.parquet
 
-    Also maintains a manifest.json with the schema expected by the Streamlit UI:
+    Maintains a manifest.json the Streamlit UI expects:
         {
           "run_id": "...",
           "created_at": <epoch_seconds_float>,
@@ -25,26 +26,23 @@ class ParquetRecorder:
         }
 
     Notes:
-    - The "path" entries are RELATIVE under "data/..." so the UI can prepend DATA_URL_PREFIX.
-    - Every row you log must include a "step" integer; the UI discovers min/max by scanning it.
+    - "path" entries are RELATIVE under "data/..." (UI prepends DATA_URL_PREFIX)
+    - Every row you log must include a "step" integer
     """
     data_root: str
     run_id: str
     flush_every: int = 1000
 
     def __post_init__(self) -> None:
-        # Normalize dirs
         self.root = Path(self.data_root)
         self.run_dir = self.root / self.run_id
         self.shards_dir = self.run_dir / "shards"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.shards_dir.mkdir(parents=True, exist_ok=True)
 
-        # in-memory buffers and next shard index per table
         self._buf: Dict[str, List[Dict[str, Any]]] = {t: [] for t in TABLES}
         self._next_idx: Dict[str, int] = {t: 0 for t in TABLES}
 
-        # manifest
         now = time.time()
         self.manifest_path = self.run_dir / "manifest.json"
         self._manifest: Dict[str, Any] = {
@@ -53,9 +51,9 @@ class ParquetRecorder:
             "created_at_iso": pd.Timestamp.utcfromtimestamp(now).isoformat() + "Z",
             "shards": []
         }
-        self._write_manifest()  # create early so the UI can see a stub
+        self._write_manifest()
 
-    # ---------------- logging APIs (engine calls these) ----------------
+    # ---------------- logging APIs ----------------
     def log_event(self, **row: Any) -> None:
         self._buf["events"].append(self._with_common(row)); self._maybe_flush("events")
 
@@ -74,9 +72,11 @@ class ParquetRecorder:
     def log_env(self, **row: Any) -> None:
         self._buf["env"].append(self._with_common(row)); self._maybe_flush("env")
 
+    def log_catalyst(self, **row: Any) -> None:
+        self._buf["catalysts"].append(self._with_common(row)); self._maybe_flush("catalysts")
+
     # ---------------- housekeeping ----------------
     def _with_common(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        # Require "step" for all rows
         if "step" not in row:
             raise ValueError("All rows must include 'step'")
         return row
@@ -93,7 +93,6 @@ class ParquetRecorder:
         fname = f"{table}_{idx:03d}.parquet"
         path = self.shards_dir / fname
 
-        # to DataFrame with stable column ordering (step first if present)
         df = pd.DataFrame(buf)
         if "step" in df.columns:
             cols = ["step"] + [c for c in df.columns if c != "step"]
@@ -101,25 +100,20 @@ class ParquetRecorder:
 
         df.to_parquet(path, index=False)
 
-        # update manifest (relative path under data/)
         rel = f"data/runs/{self.run_id}/shards/{fname}"
         self._manifest["shards"].append({"table": table, "path": rel})
         self._write_manifest()
 
-        # advance
         self._buf[table].clear()
         self._next_idx[table] = idx + 1
 
     def _write_manifest(self) -> None:
-        # write atomically
         tmp = self.manifest_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._manifest, indent=2))
         tmp.replace(self.manifest_path)
 
     def finalize(self) -> None:
-        # flush all tables
         for t in TABLES:
             if self._buf[t]:
                 self._flush_table(t)
-        # one last manifest write
         self._write_manifest()
