@@ -26,7 +26,7 @@ def run_headless(config_path: str, data_root: str) -> None:
         flush_every=flush_every,
     )
 
-    # Run engine (pass full cfg so physics/world/io are available)
+    # Run engine (pass full cfg so physics/world/io/catalysts are available)
     eng = Engine(recorder=rec, steps=steps, cfg=cfg)
     eng.run()
 
