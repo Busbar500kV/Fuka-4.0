@@ -16,11 +16,17 @@ PREFIX_DEFAULT = st.secrets.get("DATA_URL_PREFIX", "").rstrip("/")
 if not PREFIX_DEFAULT:
     st.warning("DATA_URL_PREFIX secret missing (e.g. https://storage.googleapis.com/fuka4-runs)")
 
-# session defaults
-st.session_state.setdefault("playing", False)          # server-side play
+# Session defaults
+st.session_state.setdefault("playing", False)
 st.session_state.setdefault("frame_step", 0)
 st.session_state.setdefault("override_files", None)    # dict: table -> [urls]
-st.session_state.setdefault("active_panel", "World 3D")  # which panel is being rendered
+st.session_state.setdefault("active_panel", "World 3D")
+
+# ---------------- Tunables & caps ----------------
+DEFAULT_FPS = 6
+MAX_POINTS_PER_FRAME = 20000
+MAX_EDGES_PER_FRAME  = 3000
+WORLD_TRAIL_MAX      = 8   # how many previous steps to overlay (tiny to keep light)
 
 # --------------- Cache helpers (short TTL for "live") ---------------
 def _ttl(live: bool) -> int:
@@ -29,7 +35,6 @@ def _ttl(live: bool) -> int:
 # ---------------- HTTP helpers ----------------
 @st.cache_data(show_spinner=False)
 def http_json(url: str, ttl: int) -> Optional[dict]:
-    """Cache keyed by URL and TTL value to allow 5s vs 30s modes."""
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -103,9 +108,11 @@ def get_files(prefix: str, run_id: str, table: str, prefer_manifest: bool,
     ov = st.session_state.get("override_files")
     if isinstance(ov, dict) and table in ov:
         return ov[table]
+
     files = load_index(prefix, run_id, table, live_token, ttl)
     if files and all(_looks_http(f) for f in files):
         return files
+
     if prefer_manifest or (not files) or any(not _looks_http(f) for f in files):
         man = http_json(manifest_url(prefix, run_id, live_token), ttl)
         if man:
@@ -134,10 +141,10 @@ def query_df(sql: str, params: list) -> pd.DataFrame:
 st.sidebar.title("Fuka 4.0 Analytics")
 prefix = st.sidebar.text_input("Data URL prefix", PREFIX_DEFAULT)
 
-# Live discovery of new shards every ~5s
+# Live discovery of new shards every ~10s to keep load low
 live_refresh = st.sidebar.toggle("Live refresh (discover new shards)", value=True,
-                                 help="Auto cache-bust indices/manifest every 5s")
-live_token = int(time.time()) // 5 if live_refresh else None
+                                 help="Auto cache-bust indices/manifest every ~10s")
+live_token = int(time.time()) // 10 if live_refresh else None
 ttl_val = _ttl(live_refresh)
 
 runs = list_runs(prefix, live_token, ttl_val)
@@ -147,8 +154,9 @@ if not run_id and manual_run:
     run_id = manual_run.strip()
 prefer_manifest = st.sidebar.toggle("Prefer manifest when *_index.json is empty or local", value=True)
 
-# Active panel (render exactly one for stability)
-panel = st.sidebar.radio("Panel", ["World 3D", "Edges 3D", "Events", "Spectra", "Overview", "Diagnostics"],
+# Active panel (render one at a time for stability)
+panel = st.sidebar.radio("Panel",
+                         ["World 3D", "Edges 3D", "Events", "Spectra", "Overview", "Diagnostics"],
                          index=["World 3D","Edges 3D","Events","Spectra","Overview","Diagnostics"].index(
                              st.session_state.get("active_panel","World 3D")))
 st.session_state.active_panel = panel
@@ -191,35 +199,46 @@ with c1:
 with c2:
     step_max = st.number_input("Step max", min_value=max(1, step_min+1), value=int(max(hi_guess, step_min+1)), step=500)
 with c3:
-    fps   = st.slider("FPS", 1, 30, 12)
+    fps   = st.slider("FPS", 1, 20, DEFAULT_FPS, help="Lower is lighter; 6 FPS is a good rough movie")
     stride = st.number_input("Δstep per frame", min_value=1,
-                             value=max(1, (int(step_max)-int(step_min))//300 or 1), step=1)
+                             value=max(1, (int(step_max)-int(step_min))//400 or 1), step=1,
+                             help="How many simulation steps to advance per frame")
 with c4:
     label = "⏵ Play" if not st.session_state.playing else "⏸ Pause"
     if st.button(label, use_container_width=True):
         st.session_state.playing = not st.session_state.playing
 
+# Optional trail for World 3D (kept tiny)
+trail_frames = st.sidebar.slider("World 3D trail (frames)", 0, WORLD_TRAIL_MAX, 2,
+                                 help="Overlay a few recent frames with fading opacity")
+
 frame_lo, frame_hi = int(step_min), int(step_max)
 
-# Server-driven animation: bump frame and rerun only when playing
+# Server-driven animation: bump frame and rerun ALWAYS when playing
 if st.session_state.playing:
     time.sleep(1.0/max(1,fps))
     nxt = int(st.session_state.frame_step) + int(stride)
     if nxt > frame_hi:
         nxt = frame_lo
     st.session_state.frame_step = int(nxt)
-    # soft auto-refresh to catch new shards / update panel
-    if live_refresh:
-        st.rerun()   # <-- FIX: use st.rerun() (experimental_rerun removed)
+    st.rerun()
 
+# Frame, window, HUD
 frame = int(st.session_state.frame_step)
+frame = max(frame_lo, min(frame_hi, frame))
+st.session_state.frame_step = frame
 
-st.caption(f"Range: [{frame_lo}, {frame_hi}] | fps={fps} | stride={stride} | panel={panel} | live={live_refresh}")
+hud1, hud2 = st.columns([3,1])
+with hud1:
+    st.markdown(f"### ⏱️ Current step: **{frame}**  &nbsp;&nbsp;|&nbsp;&nbsp; FPS **{fps}**  |  Stride **{stride}**")
+with hud2:
+    pct = 0.0 if frame_hi == frame_lo else (frame - frame_lo)/(frame_hi - frame_lo)
+    st.progress(pct, text=f"{int(100*pct)}% through range")
 
-# ---------- Shared helpers (downsampling & safe caps) ----------
-MAX_POINTS_PER_FRAME = 40000
-MAX_EDGES_PER_FRAME  = 4000
+# ---------------- DuckDB ----------------
+con = connect_duckdb()
 
+# ---------- Shared helpers ----------
 def cap_points(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
     if len(df) > max_points:
         return df.sample(int(max_points), random_state=0)
@@ -275,6 +294,7 @@ def render_events():
     files_ev = get_files(prefix, run_id, "events", prefer_manifest, live_token, ttl_val)
     if not files_ev:
         ph_table.info("No events_* shards yet."); return
+    # count events per step, but only plot up to current frame
     try:
         df = query_df("""
             SELECT step
@@ -283,16 +303,15 @@ def render_events():
         """, [files_ev, int(frame_lo), int(frame_hi)])
         if df.empty:
             ph_table.info("No events in range."); return
-        cnt = df.groupby("step", as_index=False).size().rename(columns={"size":"events"})
-        # show data up to *current* frame for movie feel
-        cur = cnt[cnt["step"] <= max(frame, frame_lo)]
+        cnt_all = df.groupby("step", as_index=False).size().rename(columns={"size":"events"})
+        cur = cnt_all[cnt_all["step"] <= frame]
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=cur["step"], y=cur["events"], mode="lines", name="# events"))
         fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
                           xaxis_title="step", yaxis_title="# events")
         ph_chart.plotly_chart(fig, use_container_width=True)
     except Exception:
-        # Legacy fallback
+        # Legacy fallback: sum dm
         try:
             df = query_df("""
                 SELECT step, dm
@@ -302,7 +321,7 @@ def render_events():
             if df.empty:
                 ph_table.info("No readable events in either schema for this range."); return
             agg = df.groupby("step", as_index=False)["dm"].sum().rename(columns={"dm":"dm_sum"})
-            cur = agg[agg["step"] <= max(frame, frame_lo)]
+            cur = agg[agg["step"] <= frame]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=cur["step"], y=cur["dm_sum"], mode="lines", name="Σ dm"))
             fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
@@ -315,6 +334,7 @@ def render_spectra():
     files_sp = get_files(prefix, run_id, "spectra", prefer_manifest, live_token, ttl_val)
     if not files_sp:
         ph_table.info("No spectra_* shards yet."); return
+    # Show histogram for the *current* step (movie feel)
     try:
         sdf = query_df("""
             SELECT step, counts, bin_edges
@@ -324,10 +344,9 @@ def render_spectra():
         """, [files_sp, int(frame_lo), int(frame_hi)])
         if sdf.empty or "counts" not in sdf.columns:
             raise RuntimeError("No counts column")
-        # show the histogram for the *current* frame only
-        row = sdf[sdf["step"] == max(frame, frame_lo)]
+        row = sdf[sdf["step"] == frame]
         if row.empty:
-            ph_table.info("No spectrum at current frame."); return
+            ph_table.info("No spectrum at current step."); return
         counts = list(row.iloc[0]["counts"] or [])
         edges  = list(row.iloc[0]["bin_edges"] or [])
         if edges and len(edges) >= 2:
@@ -336,12 +355,12 @@ def render_spectra():
         else:
             x_bins = list(range(len(counts)))
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=x_bins, y=counts, name=f"step {int(row.iloc[0]['step'])}"))
+        fig.add_trace(go.Bar(x=x_bins, y=counts, name=f"step {frame}"))
         fig.update_layout(height=360, margin=dict(l=10,r=10,t=30,b=10),
                           xaxis_title="bin", yaxis_title="count")
         ph_chart.plotly_chart(fig, use_container_width=True)
     except Exception:
-        # Legacy fallback: running mean plot up to current frame
+        # Legacy fallback: running mean up to current step
         try:
             df = query_df("""
                 SELECT step, AVG(F_local) AS F_mean
@@ -349,7 +368,7 @@ def render_spectra():
                 WHERE step BETWEEN ? AND ?
                 GROUP BY step ORDER BY step
             """, [files_sp, int(frame_lo), int(frame_hi)])
-            cur = df[df["step"] <= max(frame, frame_lo)]
+            cur = df[df["step"] <= frame]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=cur["step"], y=cur["F_mean"], mode="lines+markers", name="F_mean"))
             fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
@@ -358,44 +377,89 @@ def render_spectra():
         except Exception:
             ph_table.info("No readable spectra in either schema for this range.")
 
+def _read_state_at(step_val: int, files_state: List[str]) -> pd.DataFrame:
+    # Try new schema
+    df = query_df("""
+        SELECT step, x, y, z, value
+        FROM read_parquet(?)
+        WHERE step = ?
+    """, [files_state, int(step_val)])
+    if not df.empty and {"x","y","z","value"}.issubset(df.columns):
+        return df
+    # Legacy
+    df = query_df("""
+        SELECT step, x, y, z, m AS value
+        FROM read_parquet(?)
+        WHERE step = ?
+    """, [files_state, int(step_val)])
+    return df
+
 def render_world3d():
     files_state = get_files(prefix, run_id, "state", prefer_manifest, live_token, ttl_val)
     if not files_state:
         ph_table.info("No state_* shards yet."); return
-    # Read ONLY current frame’s points
-    df = pd.DataFrame()
-    try:
-        df = query_df("""
-            SELECT step, x, y, z, value
-            FROM read_parquet(?)
-            WHERE step = ?
-        """, [files_state, int(max(frame, frame_lo))])
-        if df.empty or not {"x","y","z","value"}.issubset(df.columns):
-            raise RuntimeError("try legacy")
-    except Exception:
-        try:
-            df = query_df("""
-                SELECT step, x, y, z, m AS value
-                FROM read_parquet(?)
-                WHERE step = ?
-            """, [files_state, int(max(frame, frame_lo))])
-        except Exception:
-            df = pd.DataFrame()
 
-    if df.empty:
-        ph_table.info("No state at current frame."); return
-    df = cap_points(df, MAX_POINTS_PER_FRAME)
-    vmax = max(1e-9, float(df["value"].max()))
-    size = 3 + 6*(df["value"]/vmax)
+    # Current frame cloud
+    df0 = _read_state_at(frame, files_state)
+    if df0.empty:
+        ph_table.info("No state at current step."); return
+    df0 = cap_points(df0, MAX_POINTS_PER_FRAME)
+
+    # Optional small trail: fetch a few previous steps (lightweight)
+    trail_steps = []
+    if trail_frames > 0:
+        for k in range(1, trail_frames+1):
+            s = frame - k*int(stride)
+            if s < frame_lo:
+                break
+            trail_steps.append(s)
+
+    # Read trail frames (sampled, fewer points)
+    trail_chunks = []
+    per_trail = max(5000, MAX_POINTS_PER_FRAME // 8)
+    for s in trail_steps:
+        dfi = _read_state_at(s, files_state)
+        if dfi.empty:
+            continue
+        dfi = cap_points(dfi, per_trail)
+        dfi["__age"] = frame - s  # 1 = newest older frame
+        trail_chunks.append(dfi)
+    trail_df = pd.concat(trail_chunks, ignore_index=True) if trail_chunks else pd.DataFrame()
+
+    # Build plot
+    vmax = max(1e-9, float(df0["value"].max()))
     fig = go.Figure()
+
+    # Current frame points
+    size0 = 3 + 6*(df0["value"]/vmax)
     fig.add_trace(go.Scatter3d(
-        x=df["x"], y=df["y"], z=df["z"],
+        x=df0["x"], y=df0["y"], z=df0["z"],
         mode="markers",
-        marker=dict(size=size, color=df["value"], colorscale="Viridis", showscale=True,
+        marker=dict(size=size0, color=df0["value"], colorscale="Viridis", showscale=True,
                     colorbar=dict(title="value")),
-        name="state(value)"
+        name=f"state(step={frame})"
     ))
-    fig.update_layout(height=600, scene=dict(aspectmode="data"),
+
+    # Trail points with fading opacity (no colorbar)
+    if not trail_df.empty:
+        # normalize opacity by age (more recent = more opaque)
+        ages = trail_df["__age"].astype(float).to_numpy()
+        if len(ages) > 0:
+            # map age 1..trail_frames -> opacity 0.5..0.15
+            op = 0.5 - (ages-1) * (0.35/max(1.0, float(trail_frames)))
+            op = np.clip(op, 0.15, 0.5)
+        else:
+            op = 0.2
+        size_t = 2 + 4*(trail_df["value"]/vmax)
+        fig.add_trace(go.Scatter3d(
+            x=trail_df["x"], y=trail_df["y"], z=trail_df["z"],
+            mode="markers",
+            marker=dict(size=size_t, color=trail_df["value"], colorscale="Viridis",
+                        showscale=False, opacity=float(np.mean(op)) if np.ndim(op)==1 else 0.2),
+            name=f"trail({len(trail_steps)} frames)"
+        ))
+
+    fig.update_layout(height=650, scene=dict(aspectmode="data"),
                       margin=dict(l=10,r=10,t=30,b=10))
     ph_chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
@@ -403,18 +467,17 @@ def render_edges3d():
     files_edges = get_files(prefix, run_id, "edges", prefer_manifest, live_token, ttl_val)
     if not files_edges:
         ph_table.info("No edges_* shards yet."); return
-    # Read ONLY current frame’s edges
+    # Current frame only (edges are heavy)
     drawn = False
     try:
         edf = query_df("""
             SELECT x0, y0, z0, x1, y1, z1, v0
             FROM read_parquet(?)
             WHERE step = ?
-        """, [files_edges, int(max(frame, frame_lo))])
+        """, [files_edges, int(frame)])
         if not edf.empty and {"x0","y0","z0","x1","y1","z1"}.issubset(edf.columns):
             if len(edf) > MAX_EDGES_PER_FRAME:
                 edf = edf.sample(MAX_EDGES_PER_FRAME, random_state=0)
-            # pack into polyline with None separators
             x = []; y = []; z = []
             for _, r in edf.iterrows():
                 x += [r["x0"], r["x1"], None]
@@ -423,7 +486,7 @@ def render_edges3d():
             fig = go.Figure()
             fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode="lines",
                                        line=dict(width=3.0), showlegend=False))
-            fig.update_layout(height=600, scene=dict(aspectmode="data"),
+            fig.update_layout(height=650, scene=dict(aspectmode="data"),
                               margin=dict(l=10,r=10,t=30,b=10))
             ph_chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             drawn = True
@@ -431,48 +494,8 @@ def render_edges3d():
         pass
 
     if not drawn:
-        # Legacy fallback: need state to map conn ids → coords
-        try:
-            files_state = get_files(prefix, run_id, "state", prefer_manifest, live_token, ttl_val)
-            if not files_state:
-                ph_table.info("State shards unavailable for legacy edges mapping."); return
-            e = query_df("""
-                SELECT src_conn, dst_conn, weight, t, x AS xs, y AS ys, z AS zs
-                FROM read_parquet(?)
-                WHERE step = ?
-            """, [files_edges, int(max(frame, frame_lo))])
-            s = query_df("""
-                SELECT conn_id, x AS xd, y AS yd, z AS zd
-                FROM read_parquet(?)
-                WHERE step = ?
-            """, [files_state, int(max(frame, frame_lo))])
-            if e.empty or s.empty:
-                ph_table.info("No edges/state at current frame."); return
-            s = s.set_index("conn_id")
-            rows = []
-            for _, r in e.iterrows():
-                if r["dst_conn"] in s.index:
-                    dst = s.loc[r["dst_conn"]]
-                    rows.append((float(r["xs"]), float(r["ys"]), float(r["zs"]),
-                                 float(dst["xd"]), float(dst["yd"]), float(dst["zd"])))
-            if not rows:
-                ph_table.info("No mappable edges at current frame."); return
-            seg = pd.DataFrame(rows, columns=["x1","y1","z1","x2","y2","z2"])
-            if len(seg) > MAX_EDGES_PER_FRAME:
-                seg = seg.sample(MAX_EDGES_PER_FRAME, random_state=0)
-            x = []; y = []; z = []
-            for _, srow in seg.iterrows():
-                x += [srow.x1, srow.x2, None]
-                y += [srow.y1, srow.y2, None]
-                z += [srow.z1, srow.z2, None]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode="lines",
-                                       line=dict(width=3.0), showlegend=False))
-            fig.update_layout(height=600, scene=dict(aspectmode="data"),
-                              margin=dict(l=10,r=10,t=30,b=10))
-            ph_chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        except Exception:
-            ph_table.info("No readable edges in either schema at current frame.")
+        # Legacy fallback (needs state coords; we skip here for lightness)
+        ph_table.info("No readable edges in 3D schema at current step.")
 
 def render_diag():
     st.subheader("Diagnostics")
