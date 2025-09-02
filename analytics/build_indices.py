@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List, Dict
 import argparse, subprocess, urllib.request, json
 
-TABLES = ["events","spectra","state","ledger","edges","env"]
+TABLES = ["events","spectra","state","ledger","edges","env","catalysts"]
 
 def _write_json(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +45,6 @@ def publish_runs_index(bucket: str, run_id: str) -> None:
     subprocess.run(["gsutil", "cp", str(tmp), f"gs://{bucket}/runs/index.json"], check=True)
 
 def publish_manifest_gcs(bucket: str, run_id: str) -> None:
-    # Build manifest with RELATIVE paths under data/...
     shards = []
     for t in TABLES:
         objs = list_gcs_objects(bucket, run_id, t)
@@ -61,7 +60,7 @@ def write_local_indices_and_manifest(data_root: Path, run_id: str) -> None:
     for t in TABLES:
         loc = list_local_files(data_root, run_id, t)
         _write_json(out_dir / f"{t}_index.json", {"table": t, "run_id": run_id, "files": loc})
-    # manifest: relative paths under data/...
+    # manifest: relative paths
     shards_dir = data_root / "runs" / run_id / "shards"
     shards = []
     for t in TABLES:
