@@ -13,9 +13,9 @@
 #   FUKA_STEP_SECONDS=0.2
 #   FUKA_MAX_POINTS=8000
 #   FUKA_MAX_EDGES=8000
-#   FUKA_POINT_RADIUS=0.04 (scene units)
+#   FUKA_POINT_RADIUS=0.04
 #   FUKA_EDGE_WIDTH=2.0
-#   FUKA_PAD=0.5  (extra padding around the data bbox)
+#   FUKA_PAD=0.5
 
 from __future__ import annotations
 import os
@@ -24,9 +24,10 @@ import numpy as np
 from typing import Tuple
 
 from manim import (
-    ThreeDScene, VGroup, Dot3D, Line3D, Color,
+    ThreeDScene, VGroup, Dot3D, Line3D,
     ORIGIN, config
 )
+from manim.utils.color import Color  # <-- fix: import Color from utils.color
 
 # ---------- helpers ----------
 
@@ -47,7 +48,6 @@ def _load_npz() -> Tuple[np.ndarray, dict]:
     if not npz_path:
         raise RuntimeError("FUKA_NPZ not set (path to packed NPZ).")
     data = np.load(npz_path, allow_pickle=False)
-    # required keys
     required = [
         "steps",
         "state_x","state_y","state_z","state_value","state_idx",
@@ -59,7 +59,7 @@ def _load_npz() -> Tuple[np.ndarray, dict]:
     return data["steps"], {k: data[k] for k in required if k != "steps"}
 
 def _value_to_rgb(vals: np.ndarray) -> np.ndarray:
-    """Map scalar values -> RGB in [0,1]. Simple Viridis-like tri-gradient."""
+    """Map scalar values -> RGB in [0,1]. Simple tri-gradient."""
     if vals.size == 0:
         return np.zeros((0,3), dtype=float)
     vmin = float(np.nanmin(vals))
@@ -67,16 +67,13 @@ def _value_to_rgb(vals: np.ndarray) -> np.ndarray:
     if not math.isfinite(vmin) or not math.isfinite(vmax) or vmax <= vmin:
         vmax = vmin + 1.0
     t = (vals - vmin) / (vmax - vmin)
-    # piecewise: blue(0,0,0.5)->green(0,1,0)->yellow(1,1,0)
     rgb = np.zeros((len(vals),3), dtype=float)
-    # 0..0.5: blue -> green
     mask1 = t <= 0.5
     a = np.zeros_like(t)
     a[mask1] = t[mask1] / 0.5
     rgb[mask1, 0] = 0.0
     rgb[mask1, 1] = a[mask1]
     rgb[mask1, 2] = 0.5 * (1.0 - a[mask1])
-    # 0.5..1: green -> yellow
     mask2 = ~mask1
     b = (t[mask2] - 0.5) / 0.5
     rgb[mask2, 0] = b
@@ -87,7 +84,6 @@ def _value_to_rgb(vals: np.ndarray) -> np.ndarray:
 def _downsample(n: int, max_n: int) -> np.ndarray:
     if n <= max_n:
         return np.arange(n, dtype=int)
-    # uniform stride
     stride = max(1, n // max_n)
     idx = np.arange(0, n, stride, dtype=int)
     if idx.size > max_n:
@@ -98,7 +94,6 @@ def _downsample(n: int, max_n: int) -> np.ndarray:
 
 class FukaWorldEdges3D(ThreeDScene):
     def construct(self):
-        # env knobs
         fps = _env_int("FUKA_FPS", 6)
         step_secs = _env_float("FUKA_STEP_SECONDS", 0.2)
         max_points = _env_int("FUKA_MAX_POINTS", 8000)
@@ -107,19 +102,15 @@ class FukaWorldEdges3D(ThreeDScene):
         edge_width   = _env_float("FUKA_EDGE_WIDTH", 2.0)
         pad          = _env_float("FUKA_PAD", 0.5)
 
-        # apply FPS from env (also set via CLI in wrapper)
         config.frame_rate = fps
 
         steps, D = _load_npz()
-        # state arrays
         sx, sy, sz = D["state_x"], D["state_y"], D["state_z"]
         sv = D["state_value"]; sidx = D["state_idx"]
-        # edges arrays
         ex0, ey0, ez0 = D["edges_x0"], D["edges_y0"], D["edges_z0"]
         ex1, ey1, ez1 = D["edges_x1"], D["edges_y1"], D["edges_z1"]
         eidx = D["edges_idx"]
 
-        # global bbox (for camera frame / padding)
         if sx.size:
             xmin, xmax = float(np.min(sx)), float(np.max(sx))
             ymin, ymax = float(np.min(sy)), float(np.max(sy))
@@ -131,14 +122,12 @@ class FukaWorldEdges3D(ThreeDScene):
         xmin -= pad * xrange; xmax += pad * xrange
         ymin -= pad * yrange; ymax += pad * yrange
         zmin -= pad * zrange; zmax += pad * zrange
-        # basic camera setup
+
         self.set_camera_orientation(phi=70*math.pi/180, theta=45*math.pi/180, zoom=1.0)
         self.camera.frame.move_to(((xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2))
 
-        # iterate frames
         F = int(steps.shape[0])
         for fi in range(F):
-            # state slice
             s_lo = int(sidx[fi]); s_hi = int(sidx[fi+1])
             n_s = max(0, s_hi - s_lo)
             pts_group = VGroup()
@@ -147,14 +136,12 @@ class FukaWorldEdges3D(ThreeDScene):
                 xs, ys, zs = sx[si], sy[si], sz[si]
                 vals = sv[si]
                 cols = _value_to_rgb(vals)
-
                 for j in range(xs.shape[0]):
                     d = Dot3D(point=(float(xs[j]), float(ys[j]), float(zs[j])), radius=point_radius)
                     c = Color(rgb=(float(cols[j,0]), float(cols[j,1]), float(cols[j,2])))
                     d.set_fill(c, opacity=1.0).set_stroke(c, opacity=1.0, width=0.0)
                     pts_group.add(d)
 
-            # edges slice
             e_lo = int(eidx[fi]); e_hi = int(eidx[fi+1])
             n_e = max(0, e_hi - e_lo)
             edges_group = VGroup()
