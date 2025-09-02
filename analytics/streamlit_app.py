@@ -1,5 +1,5 @@
 # analytics/streamlit_app.py
-import json, time, urllib.request, math
+import json, urllib.request, math, time
 from urllib.error import HTTPError, URLError
 from typing import Dict, List, Optional, Tuple
 
@@ -16,19 +16,17 @@ PREFIX_DEFAULT = st.secrets.get("DATA_URL_PREFIX", "").rstrip("/")
 if not PREFIX_DEFAULT:
     st.warning("DATA_URL_PREFIX secret missing (e.g. https://storage.googleapis.com/fuka4-runs)")
 
-# Session defaults
-st.session_state.setdefault("playing", False)
+# Session defaults (no animation; scrubber drives "frame_step")
 st.session_state.setdefault("frame_step", 0)
 st.session_state.setdefault("override_files", None)    # dict: table -> [urls]
 st.session_state.setdefault("active_panel", "World 3D")
 
 # ---------------- Tunables & caps ----------------
-DEFAULT_FPS = 6
 MAX_POINTS_PER_FRAME = 20000
 MAX_EDGES_PER_FRAME  = 3000
-WORLD_TRAIL_MAX      = 8   # how many previous steps to overlay (tiny to keep light)
+WORLD_TRAIL_STEPS_DEFAULT = 0     # default: no trail (set >0 in sidebar if you want a short trail)
 
-# --------------- Cache helpers (short TTL for "live") ---------------
+# --------------- Cache helpers (short TTL for “live”) ---------------
 def _ttl(live: bool) -> int:
     return 5 if live else 30
 
@@ -108,11 +106,9 @@ def get_files(prefix: str, run_id: str, table: str, prefer_manifest: bool,
     ov = st.session_state.get("override_files")
     if isinstance(ov, dict) and table in ov:
         return ov[table]
-
     files = load_index(prefix, run_id, table, live_token, ttl)
     if files and all(_looks_http(f) for f in files):
         return files
-
     if prefer_manifest or (not files) or any(not _looks_http(f) for f in files):
         man = http_json(manifest_url(prefix, run_id, live_token), ttl)
         if man:
@@ -141,7 +137,7 @@ def query_df(sql: str, params: list) -> pd.DataFrame:
 st.sidebar.title("Fuka 4.0 Analytics")
 prefix = st.sidebar.text_input("Data URL prefix", PREFIX_DEFAULT)
 
-# Live discovery of new shards every ~10s to keep load low
+# Live discovery of new shards every ~10s
 live_refresh = st.sidebar.toggle("Live refresh (discover new shards)", value=True,
                                  help="Auto cache-bust indices/manifest every ~10s")
 live_token = int(time.time()) // 10 if live_refresh else None
@@ -161,10 +157,15 @@ panel = st.sidebar.radio("Panel",
                              st.session_state.get("active_panel","World 3D")))
 st.session_state.active_panel = panel
 
+# Optional small trail for World 3D (in *steps*, not frames)
+world_trail_steps = st.sidebar.number_input("World 3D trail (previous steps)", min_value=0,
+                                            value=WORLD_TRAIL_STEPS_DEFAULT, step=1,
+                                            help="Overlay a few previous steps with fading opacity")
+
 if not run_id:
     st.stop()
 
-# ---------------- Header + animation controls ----------------
+# ---------------- Header + scrubber ----------------
 st.title(f"Fuka 4.0 — Run: {run_id}")
 
 @st.cache_data(show_spinner=False)
@@ -193,58 +194,34 @@ lo_guess, hi_guess = discover_step_bounds(prefix, run_id, prefer_manifest, live_
 if lo_guess >= hi_guess:
     hi_guess = lo_guess + 1
 
-c1,c2,c3,c4 = st.columns([1,1,1,2])
+c1,c2 = st.columns([1,1])
 with c1:
     step_min = st.number_input("Step min", min_value=0, value=int(lo_guess), step=100)
 with c2:
-    step_max = st.number_input("Step max", min_value=max(1, step_min+1), value=int(max(hi_guess, step_min+1)), step=500)
-with c3:
-    fps   = st.slider("FPS", 1, 20, DEFAULT_FPS, help="Lower is lighter; 6 FPS is a good rough movie")
-    stride = st.number_input("Δstep per frame", min_value=1,
-                             value=max(1, (int(step_max)-int(step_min))//400 or 1), step=1,
-                             help="How many simulation steps to advance per frame")
-with c4:
-    label = "⏵ Play" if not st.session_state.playing else "⏸ Pause"
-    if st.button(label, use_container_width=True):
-        st.session_state.playing = not st.session_state.playing
+    step_max = st.number_input("Step max", min_value=max(1, step_min+1),
+                               value=int(max(hi_guess, step_min+1)), step=500)
 
-# Optional trail for World 3D (kept tiny)
-trail_frames = st.sidebar.slider("World 3D trail (frames)", 0, WORLD_TRAIL_MAX, 2,
-                                 help="Overlay a few recent frames with fading opacity")
+# Scrubber: the ONE control that drives updates
+frame = st.slider("Scrub step (time)", min_value=int(step_min), max_value=int(step_max),
+                  value=int(min(max(st.session_state.frame_step, step_min), step_max)),
+                  step=1, help="Drag to change the current simulation step")
+st.session_state.frame_step = int(frame)
 
-frame_lo, frame_hi = int(step_min), int(step_max)
-
-# Server-driven animation: bump frame and rerun ALWAYS when playing
-if st.session_state.playing:
-    time.sleep(1.0/max(1,fps))
-    nxt = int(st.session_state.frame_step) + int(stride)
-    if nxt > frame_hi:
-        nxt = frame_lo
-    st.session_state.frame_step = int(nxt)
-    st.rerun()
-
-# Frame, window, HUD
-frame = int(st.session_state.frame_step)
-frame = max(frame_lo, min(frame_hi, frame))
-st.session_state.frame_step = frame
-
+# HUD
 hud1, hud2 = st.columns([3,1])
 with hud1:
-    st.markdown(f"### ⏱️ Current step: **{frame}**  &nbsp;&nbsp;|&nbsp;&nbsp; FPS **{fps}**  |  Stride **{stride}**")
+    st.markdown(f"### ⏱️ Current step: **{frame}**")
 with hud2:
-    pct = 0.0 if frame_hi == frame_lo else (frame - frame_lo)/(frame_hi - frame_lo)
+    pct = 0.0 if step_max == step_min else (frame - step_min)/(step_max - step_min)
     st.progress(pct, text=f"{int(100*pct)}% through range")
 
-# ---------------- DuckDB ----------------
-con = connect_duckdb()
-
-# ---------- Shared helpers ----------
+# ---------------- Shared helpers ----------------
 def cap_points(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
     if len(df) > max_points:
         return df.sample(int(max_points), random_state=0)
     return df
 
-# ---------------- Single-panel placeholders ----------------
+# ---------------- Panel placeholders ----------------
 ph_chart = st.empty()
 ph_table = st.empty()
 
@@ -279,7 +256,7 @@ def render_overview():
                        SUM(cat_deposit) AS sum_cat_deposit
                 FROM read_parquet(?)
                 WHERE step BETWEEN ? AND ?
-            """, [files_ledger, int(frame_lo), int(frame_hi)])
+            """, [files_ledger, int(step_min), int(step_max)])
         except Exception:
             df = query_df("""
                 SELECT MIN(step) AS min_step, MAX(step) AS max_step,
@@ -287,20 +264,20 @@ def render_overview():
                        SUM(balance_error) AS sum_balance_error
                 FROM read_parquet(?)
                 WHERE step BETWEEN ? AND ?
-            """, [files_ledger, int(frame_lo), int(frame_hi)])
+            """, [files_ledger, int(step_min), int(step_max)])
         ph_table.dataframe(df)
 
 def render_events():
     files_ev = get_files(prefix, run_id, "events", prefer_manifest, live_token, ttl_val)
     if not files_ev:
         ph_table.info("No events_* shards yet."); return
-    # count events per step, but only plot up to current frame
+    # Count events per step up to current frame
     try:
         df = query_df("""
             SELECT step
             FROM read_parquet(?)
             WHERE step BETWEEN ? AND ?
-        """, [files_ev, int(frame_lo), int(frame_hi)])
+        """, [files_ev, int(step_min), int(step_max)])
         if df.empty:
             ph_table.info("No events in range."); return
         cnt_all = df.groupby("step", as_index=False).size().rename(columns={"size":"events"})
@@ -317,7 +294,7 @@ def render_events():
                 SELECT step, dm
                 FROM read_parquet(?)
                 WHERE step BETWEEN ? AND ?
-            """, [files_ev, int(frame_lo), int(frame_hi)])
+            """, [files_ev, int(step_min), int(step_max)])
             if df.empty:
                 ph_table.info("No readable events in either schema for this range."); return
             agg = df.groupby("step", as_index=False)["dm"].sum().rename(columns={"dm":"dm_sum"})
@@ -334,14 +311,14 @@ def render_spectra():
     files_sp = get_files(prefix, run_id, "spectra", prefer_manifest, live_token, ttl_val)
     if not files_sp:
         ph_table.info("No spectra_* shards yet."); return
-    # Show histogram for the *current* step (movie feel)
+    # Show histogram for the *current* step
     try:
         sdf = query_df("""
             SELECT step, counts, bin_edges
             FROM read_parquet(?)
             WHERE step BETWEEN ? AND ?
             ORDER BY step
-        """, [files_sp, int(frame_lo), int(frame_hi)])
+        """, [files_sp, int(step_min), int(step_max)])
         if sdf.empty or "counts" not in sdf.columns:
             raise RuntimeError("No counts column")
         row = sdf[sdf["step"] == frame]
@@ -367,7 +344,7 @@ def render_spectra():
                 FROM read_parquet(?)
                 WHERE step BETWEEN ? AND ?
                 GROUP BY step ORDER BY step
-            """, [files_sp, int(frame_lo), int(frame_hi)])
+            """, [files_sp, int(step_min), int(step_max)])
             cur = df[df["step"] <= frame]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=cur["step"], y=cur["F_mean"], mode="lines+markers", name="F_mean"))
@@ -399,38 +376,32 @@ def render_world3d():
     if not files_state:
         ph_table.info("No state_* shards yet."); return
 
-    # Current frame cloud
+    # Current step cloud
     df0 = _read_state_at(frame, files_state)
     if df0.empty:
         ph_table.info("No state at current step."); return
     df0 = cap_points(df0, MAX_POINTS_PER_FRAME)
 
-    # Optional small trail: fetch a few previous steps (lightweight)
-    trail_steps = []
-    if trail_frames > 0:
-        for k in range(1, trail_frames+1):
-            s = frame - k*int(stride)
-            if s < frame_lo:
-                break
-            trail_steps.append(s)
+    # Tiny trail: previous N *steps* (not frames)
+    trail_df = pd.DataFrame()
+    if world_trail_steps > 0:
+        chunks = []
+        per_trail = max(4000, MAX_POINTS_PER_FRAME // 8)
+        for s in range(1, world_trail_steps+1):
+            step_prev = frame - s
+            if step_prev < step_min: break
+            dfi = _read_state_at(step_prev, files_state)
+            if dfi.empty: continue
+            dfi = cap_points(dfi, per_trail)
+            dfi["__age"] = s
+            chunks.append(dfi)
+        if chunks:
+            trail_df = pd.concat(chunks, ignore_index=True)
 
-    # Read trail frames (sampled, fewer points)
-    trail_chunks = []
-    per_trail = max(5000, MAX_POINTS_PER_FRAME // 8)
-    for s in trail_steps:
-        dfi = _read_state_at(s, files_state)
-        if dfi.empty:
-            continue
-        dfi = cap_points(dfi, per_trail)
-        dfi["__age"] = frame - s  # 1 = newest older frame
-        trail_chunks.append(dfi)
-    trail_df = pd.concat(trail_chunks, ignore_index=True) if trail_chunks else pd.DataFrame()
-
-    # Build plot
     vmax = max(1e-9, float(df0["value"].max()))
     fig = go.Figure()
 
-    # Current frame points
+    # Current step
     size0 = 3 + 6*(df0["value"]/vmax)
     fig.add_trace(go.Scatter3d(
         x=df0["x"], y=df0["y"], z=df0["z"],
@@ -440,23 +411,18 @@ def render_world3d():
         name=f"state(step={frame})"
     ))
 
-    # Trail points with fading opacity (no colorbar)
+    # Trail (fading opacity)
     if not trail_df.empty:
-        # normalize opacity by age (more recent = more opaque)
         ages = trail_df["__age"].astype(float).to_numpy()
-        if len(ages) > 0:
-            # map age 1..trail_frames -> opacity 0.5..0.15
-            op = 0.5 - (ages-1) * (0.35/max(1.0, float(trail_frames)))
-            op = np.clip(op, 0.15, 0.5)
-        else:
-            op = 0.2
+        op = 0.5 - (ages-1) * (0.35/max(1.0, float(world_trail_steps)))
+        op = np.clip(op, 0.15, 0.5)
         size_t = 2 + 4*(trail_df["value"]/vmax)
         fig.add_trace(go.Scatter3d(
             x=trail_df["x"], y=trail_df["y"], z=trail_df["z"],
             mode="markers",
             marker=dict(size=size_t, color=trail_df["value"], colorscale="Viridis",
-                        showscale=False, opacity=float(np.mean(op)) if np.ndim(op)==1 else 0.2),
-            name=f"trail({len(trail_steps)} frames)"
+                        showscale=False, opacity=float(np.mean(op))),
+            name=f"trail({world_trail_steps} steps)"
         ))
 
     fig.update_layout(height=650, scene=dict(aspectmode="data"),
@@ -467,7 +433,7 @@ def render_edges3d():
     files_edges = get_files(prefix, run_id, "edges", prefer_manifest, live_token, ttl_val)
     if not files_edges:
         ph_table.info("No edges_* shards yet."); return
-    # Current frame only (edges are heavy)
+    # Current step only (edges are heavy)
     drawn = False
     try:
         edf = query_df("""
@@ -492,9 +458,7 @@ def render_edges3d():
             drawn = True
     except Exception:
         pass
-
     if not drawn:
-        # Legacy fallback (needs state coords; we skip here for lightness)
         ph_table.info("No readable edges in 3D schema at current step.")
 
 def render_diag():
