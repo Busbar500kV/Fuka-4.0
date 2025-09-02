@@ -1,13 +1,13 @@
 # render/manim_fuka_scene.py
 # Manim scene that reads an NPZ created by fuka.render.pack_npz
-# Expected NPZ keys:
+# Required NPZ keys:
 #   steps: (F,)
 #   state_x/state_y/state_z/state_value: (N_state_total,)
 #   state_idx: (F+1,)
 #   edges_x0/edges_y0/edges_z0/edges_x1/edges_y1/edges_z1: (N_edge_total,)
 #   edges_idx: (F+1,)
 #
-# Optional env knobs:
+# Env knobs (optional):
 #   FUKA_NPZ=</abs/path/to.npz>
 #   FUKA_FPS=6
 #   FUKA_STEP_SECONDS=0.2
@@ -25,7 +25,7 @@ import numpy as np
 
 from manim import (
     ThreeDScene, VGroup, Dot3D, Line3D,
-    ORIGIN, config
+    config
 )
 
 # ---------- helpers ----------
@@ -105,7 +105,7 @@ class FukaWorldEdges3D(ThreeDScene):
         ex1, ey1, ez1 = D["edges_x1"], D["edges_y1"], D["edges_z1"]
         eidx = D["edges_idx"]
 
-        # bounds & camera
+        # bounds (for centring / scale hints)
         if sx.size:
             xmin, xmax = float(np.min(sx)), float(np.max(sx))
             ymin, ymax = float(np.min(sy)), float(np.max(sy))
@@ -113,13 +113,16 @@ class FukaWorldEdges3D(ThreeDScene):
         else:
             xmin = ymin = zmin = -1.0
             xmax = ymax = zmax =  1.0
-        xrange = xmax - xmin; yrange = ymax - ymin; zrange = zmax - zmin
-        xmin -= pad * xrange; xmax += pad * xrange
-        ymin -= pad * yrange; ymax += pad * yrange
-        zmin -= pad * zrange; zmax += pad * zrange
+        xrange = max(1e-9, xmax - xmin)
+        yrange = max(1e-9, ymax - ymin)
+        zrange = max(1e-9, zmax - zmin)
 
+        # compute centre & pad (we'll re-centre geometry, not the camera)
+        cx, cy, cz = (xmin + xmax) * 0.5, (ymin + ymax) * 0.5, (zmin + zmax) * 0.5
+        # padding is left in case you later add axes/cubes
+
+        # camera angles (don’t touch .frame — incompatible in v0.19)
         self.set_camera_orientation(phi=70*math.pi/180, theta=45*math.pi/180, zoom=1.0)
-        self.camera.frame.move_to(((xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2))
 
         # animate frames
         F = int(steps.shape[0])
@@ -130,7 +133,9 @@ class FukaWorldEdges3D(ThreeDScene):
             pts_group = VGroup()
             if n_s > 0:
                 si = _downsample(n_s, max_points) + s_lo
-                xs, ys, zs = sx[si], sy[si], sz[si]
+                xs = sx[si] - cx
+                ys = sy[si] - cy
+                zs = sz[si] - cz
                 cols = _value_to_rgb(sv[si])
                 for j in range(xs.shape[0]):
                     d = Dot3D(point=(float(xs[j]), float(ys[j]), float(zs[j])), radius=point_radius)
@@ -145,8 +150,8 @@ class FukaWorldEdges3D(ThreeDScene):
             if n_e > 0:
                 ei = _downsample(n_e, max_edges) + e_lo
                 for j in ei:
-                    p0 = (float(ex0[j]), float(ey0[j]), float(ez0[j]))
-                    p1 = (float(ex1[j]), float(ey1[j]), float(ez1[j]))
+                    p0 = (float(ex0[j]-cx), float(ey0[j]-cy), float(ez0[j]-cz))
+                    p1 = (float(ex1[j]-cx), float(ey1[j]-cy), float(ez1[j]-cz))
                     seg = Line3D(p0, p1, stroke_width=edge_width, stroke_opacity=0.85)
                     edges_group.add(seg)
 
