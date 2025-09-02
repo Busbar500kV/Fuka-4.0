@@ -1,93 +1,66 @@
 # render/manim_fuka_scene.py
+from __future__ import annotations
 from manim import *
-import numpy as np
-import os
+import numpy as np, os
 
-def colormap_viridis(vals: np.ndarray) -> list[Color]:
+def _cmap(vals: np.ndarray):
     if len(vals) == 0:
         return []
-    vmin = float(np.min(vals))
-    vmax = float(np.max(vals))
-    if not np.isfinite(vmin) or not np.isfinite(vmax):
-        vmin, vmax = 0.0, 1.0
+    vmin, vmax = float(np.min(vals)), float(np.max(vals))
     if vmax <= vmin:
-        t = np.zeros_like(vals, dtype=float)
+        t = np.zeros_like(vals)
     else:
         t = (vals - vmin) / (vmax - vmin)
-    palette = [BLUE_E, BLUE_D, BLUE_C, TEAL_E, GREEN_E, YELLOW_E]
+    pal = [BLUE_E, BLUE_D, BLUE_C, TEAL_E, GREEN_E, YELLOW_E]
     out = []
     for x in t:
-        x = float(np.clip(x, 0.0, 1.0))
-        i = int(x * (len(palette)-1))
-        j = min(len(palette)-1, i+1)
-        alpha = x * (len(palette)-1) - i
-        out.append(interpolate_color(palette[i], palette[j], alpha))
+        i = int(x * (len(pal) - 1))
+        j = min(len(pal) - 1, i + 1)
+        a = x * (len(pal) - 1) - i
+        out.append(interpolate_color(pal[i], pal[j], a))
     return out
 
 class FukaWorldEdges3D(ThreeDScene):
-    """
-    Render a 3D movie of world points + edges over steps.
-    Expects NPZ path via env FUKA_NPZ or default 'assets/fuka_anim.npz'.
-    """
     def construct(self):
-        npz_path = os.environ.get("FUKA_NPZ", "assets/fuka_anim.npz")
-        secs_per_step = float(os.environ.get("FUKA_STEP_SECONDS", "0.05"))  # 20 steps/sec
-        point_radius  = float(os.environ.get("FUKA_POINT_RADIUS", "0.035"))
-        edge_width    = float(os.environ.get("FUKA_EDGE_WIDTH", "2.5"))
-        show_edges    = os.environ.get("FUKA_SHOW_EDGES", "1") not in ("0","false","False")
+        npz = os.environ.get("FUKA_NPZ", "assets/fuka_anim.npz")
+        step_sec = float(os.environ.get("FUKA_STEP_SECONDS", "0.05"))
+        pr = float(os.environ.get("FUKA_POINT_RADIUS", "0.035"))
+        ew = float(os.environ.get("FUKA_EDGE_WIDTH", "2.5"))
+        show_edges = os.environ.get("FUKA_SHOW_EDGES", "1") not in ("0","false","False")
 
-        data = np.load(npz_path, allow_pickle=True)
-        steps  = data["steps"]
+        data = np.load(npz, allow_pickle=True)
+        steps = data["steps"]
         states = data["states"]
-        edges  = data["edges"]
+        edges = data["edges"]
 
-        # Scene frame & camera
         self.set_camera_orientation(phi=70*DEGREES, theta=30*DEGREES, zoom=1.25)
-        # auto bounds (if your data is normalized, keep [-1,1])
         axes = ThreeDAxes(x_range=[-1,1,1], y_range=[-1,1,1], z_range=[-1,1,1])
         self.add(axes)
 
-        # Initial frame
-        k0 = 0
-        pts0 = states[k0]
-        ed0  = edges[k0]
+        def make_frame(k: int):
+            pts = VGroup()
+            s = states[k]
+            if len(s) > 0:
+                colors = _cmap(s[:,3])
+                for (x,y,z,v), c in zip(s, colors):
+                    pts.add(Dot3D(point=[x,y,z], radius=pr, color=c))
+            edg = VGroup()
+            e = edges[k]
+            if show_edges and len(e) > 0:
+                for x0,y0,z0,x1,y1,z1,_,_ in e:
+                    edg.add(Line3D([x0,y0,z0], [x1,y1,z1], stroke_width=ew, color=GRAY_B))
+            return pts, edg
 
-        pts_group = VGroup()
-        if len(pts0) > 0:
-            colors = colormap_viridis(pts0[:,3])
-            for (x,y,z,val), c in zip(pts0, colors):
-                pts_group.add(Dot3D(point=[x,y,z], radius=point_radius, color=c))
-        self.add(pts_group)
+        pts, edg = make_frame(0)
+        self.add(pts, edg)
 
-        edge_group = VGroup()
-        if show_edges and len(ed0) > 0:
-            for (x0,y0,z0,x1,y1,z1,_,_) in ed0:
-                edge_group.add(Line3D([x0,y0,z0], [x1,y1,z1], stroke_width=edge_width, color=GRAY_B))
-        self.add(edge_group)
-
-        # Animate: swap groups per step
         for k in range(1, len(steps)):
-            pts = states[k]
-            eds = edges[k]
-
-            new_pts = VGroup()
-            if len(pts) > 0:
-                colors = colormap_viridis(pts[:,3])
-                for (x,y,z,val), c in zip(pts, colors):
-                    new_pts.add(Dot3D(point=[x,y,z], radius=point_radius, color=c))
-
-            new_edges = VGroup()
-            if show_edges and len(eds) > 0:
-                for (x0,y0,z0,x1,y1,z1,_,_) in eds:
-                    new_edges.add(Line3D([x0,y0,z0], [x1,y1,z1], stroke_width=edge_width, color=GRAY_B))
-
-            # replace over a small duration; linear timing
+            npts, nedg = make_frame(k)
             self.play(
-                ReplacementTransform(pts_group, new_pts),
-                ReplacementTransform(edge_group, new_edges) if show_edges else AnimationGroup(),
-                run_time=secs_per_step, rate_func=linear
+                ReplacementTransform(pts, npts),
+                ReplacementTransform(edg, nedg) if show_edges else AnimationGroup(),
+                run_time=step_sec, rate_func=linear
             )
-            pts_group = new_pts
-            edge_group = new_edges
+            pts, edg = npts, nedg
 
         self.wait(0.25)
