@@ -1,6 +1,5 @@
 # analytics/streamlit_app.py
-
-import json, time, urllib.request, math, random
+import json, time, urllib.request, math
 from urllib.error import HTTPError, URLError
 from typing import Dict, List, Optional, Tuple
 
@@ -52,10 +51,14 @@ def manifest_to_https(prefix: str, manifest: dict) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     for s in manifest.get("shards", []):
         t = s.get("table"); p = s.get("path","")
-        if not t or not p: continue
-        if p.startswith("data/"): p = p[len("data/"):]
+        if not t or not p: 
+            continue
+        # manifest path is relative like "data/runs/<RUN_ID>/shards/xxx.parquet"
+        if p.startswith("data/"): 
+            p = p[len("data/"):]
         url = f"{prefix}/{p}"
-        if url.endswith(".parquet"): out.setdefault(t, []).append(url)
+        if url.endswith(".parquet"): 
+            out.setdefault(t, []).append(url)
     for k in list(out.keys()):
         out[k].sort()
     return out
@@ -70,22 +73,51 @@ def list_runs(prefix: str) -> List[str]:
 @st.cache_data(show_spinner=False, ttl=30)
 def load_index(prefix: str, run_id: str, table: str) -> List[str]:
     data = http_json(table_index_url(prefix, run_id, table))
-    if not data: return []
+    if not data: 
+        return []
     return data.get("files", []) or []
 
+def _looks_http(x: str) -> bool:
+    return isinstance(x, str) and (x.startswith("http://") or x.startswith("https://"))
+
 def get_files(prefix: str, run_id: str, table: str, prefer_manifest: bool=False) -> List[str]:
-    # explicit per-session override (Diagnostics → Rebuild from manifest)
+    """
+    Returns a list of Parquet URLs for the given table.
+    Order of precedence:
+      1) per-session override from Diagnostics ("Rebuild from manifest")
+      2) *_index.json IF it exists AND all entries are HTTP(S)
+      3) manifest.json (converted to HTTPS)
+    """
+    # 1) explicit override
     ov = st.session_state.get("override_files")
     if isinstance(ov, dict) and table in ov:
         return ov[table]
-    # normal: use *_index.json; if empty and prefer_manifest, try manifest
+
+    # 2) try index
     files = load_index(prefix, run_id, table)
-    if (not files) and prefer_manifest:
+    if files and all(_looks_http(f) for f in files):
+        return files
+
+    # 3) fallback to manifest when index is empty or contains local paths
+    if prefer_manifest or (not files) or any(not _looks_http(f) for f in files):
         man = http_json(manifest_url(prefix, run_id))
         if man:
             by_table = manifest_to_https(prefix, man)
-            return by_table.get(table, [])
-    return files
+            mf = by_table.get(table, [])
+            if mf:
+                return mf
+
+    return files  # may be empty
+
+# ---------------- DuckDB helper ----------------
+def connect_duckdb() -> ddb.DuckDBPyConnection:
+    con = ddb.connect(":memory:")
+    try:
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;")
+    except Exception:
+        pass
+    return con
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Fuka 4.0 Analytics")
@@ -95,7 +127,7 @@ run_id = st.sidebar.selectbox("Run", runs, index=0 if runs else None, placeholde
 manual_run = st.sidebar.text_input("Or enter run id", value="" if run_id else "")
 if not run_id and manual_run:
     run_id = manual_run.strip()
-prefer_manifest = st.sidebar.toggle("Prefer manifest when *_index.json is empty", value=True)
+prefer_manifest = st.sidebar.toggle("Prefer manifest when *_index.json is empty or local", value=True)
 
 if not run_id:
     st.stop()
@@ -108,8 +140,9 @@ def discover_step_bounds(prefix: str, run_id: str, prefer_manifest: bool) -> Tup
     lo, hi = math.inf, -math.inf
     for table in ("ledger","events","state"):
         files = get_files(prefix, run_id, table, prefer_manifest=prefer_manifest)
-        if not files: continue
-        con = ddb.connect(":memory:")
+        if not files: 
+            continue
+        con = connect_duckdb()
         try:
             df = con.execute("SELECT MIN(step) lo, MAX(step) hi FROM read_parquet(?)", [files]).df()
             if not df.empty and pd.notnull(df.iloc[0]["lo"]) and pd.notnull(df.iloc[0]["hi"]):
@@ -166,7 +199,7 @@ win_hi = min(frame_hi, frame)
 st.caption(f"Window: [{win_lo}, {win_hi}] | frame={frame} | fps={fps} | trail={trail} | stride={stride}")
 
 # ---------------- DuckDB ----------------
-con = ddb.connect(":memory:")
+con = connect_duckdb()
 
 # ---------------- Tabs ----------------
 tab_overview, tab_events, tab_spectra, tab_world3d, tab_edges3d, tab_diag = st.tabs(
@@ -187,13 +220,26 @@ with tab_overview:
     with k4: st.metric("Manifest entries", len(man.get("shards",[])) if man else 0)
 
     if files_ledger:
-        df = con.execute("""
-            SELECT MIN(step) AS min_step, MAX(step) AS max_step,
-                   SUM(dF) AS sum_dF, SUM(c2dm) AS sum_c2dm,
-                   SUM(balance_error) AS sum_balance_error
-            FROM read_parquet(?)
-            WHERE step BETWEEN ? AND ?
-        """, [files_ledger, int(win_lo), int(win_hi)]).df()
+        # Try new 3D ledger schema first; fallback to legacy
+        try:
+            df = con.execute("""
+                SELECT MIN(step) AS min_step, MAX(step) AS max_step,
+                       SUM(sum_energy) AS sum_energy,
+                       AVG(mean_energy) AS mean_energy,
+                       MAX(max_energy)  AS max_energy,
+                       AVG(std_energy)  AS std_energy,
+                       SUM(cat_deposit) AS sum_cat_deposit
+                FROM read_parquet(?)
+                WHERE step BETWEEN ? AND ?
+            """, [files_ledger, int(win_lo), int(win_hi)]).df()
+        except Exception:
+            df = con.execute("""
+                SELECT MIN(step) AS min_step, MAX(step) AS max_step,
+                       SUM(dF) AS sum_dF, SUM(c2dm) AS sum_c2dm,
+                       SUM(balance_error) AS sum_balance_error
+                FROM read_parquet(?)
+                WHERE step BETWEEN ? AND ?
+            """, [files_ledger, int(win_lo), int(win_hi)]).df()
         st.dataframe(df)
 
 # ---- Events ----
@@ -203,25 +249,55 @@ with tab_events:
     if not files:
         st.info("No events_* shards yet.")
     else:
-        df = con.execute("""
-            SELECT step, conn_id, dm, dF, w_sel, A_sel, phi_sel, T_eff
-            FROM read_parquet(?)
-            WHERE step BETWEEN ? AND ?
-        """, [files, int(win_lo), int(win_hi)]).df()
-        st.write(f"{len(df):,} rows")
-        st.dataframe(df.head(500))
-        if not df.empty:
-            df2 = con.execute("""
-                SELECT step, SUM(dm) AS dm_sum
+        # Try new 3D schema: (step, x, y, z, value)
+        df = pd.DataFrame()
+        ok = False
+        try:
+            df = con.execute("""
+                SELECT step, x, y, z, value
                 FROM read_parquet(?)
                 WHERE step BETWEEN ? AND ?
-                GROUP BY step ORDER BY step
+                ORDER BY step
             """, [files, int(win_lo), int(win_hi)]).df()
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df2["step"], y=df2["dm_sum"], mode="lines", name="Σ dm"))
-            fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
-                              xaxis_title="step", yaxis_title="sum(dm)")
-            st.plotly_chart(fig, use_container_width=True)
+            if not df.empty and set(["step","x","y","z","value"]).issubset(df.columns):
+                ok = True
+                st.write(f"{len(df):,} rows")
+                st.dataframe(df.head(500))
+                # per-step count plot
+                df2 = df.groupby("step", as_index=False).size().rename(columns={"size":"events"})
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df2["step"], y=df2["events"], mode="lines", name="events"))
+                fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
+                                  xaxis_title="step", yaxis_title="# events")
+                st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            pass
+
+        if not ok:
+            # Fallback to legacy 1D schema
+            try:
+                df = con.execute("""
+                    SELECT step, conn_id, dm, dF, w_sel, A_sel, phi_sel, T_eff
+                    FROM read_parquet(?)
+                    WHERE step BETWEEN ? AND ?
+                    ORDER BY step
+                """, [files, int(win_lo), int(win_hi)]).df()
+                st.write(f"{len(df):,} rows")
+                st.dataframe(df.head(500))
+                if not df.empty:
+                    df2 = con.execute("""
+                        SELECT step, SUM(dm) AS dm_sum
+                        FROM read_parquet(?)
+                        WHERE step BETWEEN ? AND ?
+                        GROUP BY step ORDER BY step
+                    """, [files, int(win_lo), int(win_hi)]).df()
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=df2["step"], y=df2["dm_sum"], mode="lines", name="Σ dm"))
+                    fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
+                                      xaxis_title="step", yaxis_title="sum(dm)")
+                    st.plotly_chart(fig, use_container_width=True)
+            except Exception:
+                st.error("Failed to read events table in either schema.")
 
 # ---- Spectra ----
 with tab_spectra:
@@ -230,142 +306,206 @@ with tab_spectra:
     if not files:
         st.info("No spectra_* shards yet.")
     else:
-        df = con.execute("""
-            SELECT step, w_dom, A_dom, phi_dom, AVG(F_local) AS F_mean
-            FROM read_parquet(?)
-            WHERE step BETWEEN ? AND ?
-            GROUP BY step, w_dom, A_dom, phi_dom
-            ORDER BY step
-        """, [files, int(win_lo), int(win_hi)]).df()
-        st.dataframe(df.head(300))
-        if not df.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df["step"], y=df["F_mean"], mode="lines+markers", name="F_mean"))
-            fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
-                              xaxis_title="step", yaxis_title="F_mean")
-            st.plotly_chart(fig, use_container_width=True)
+        # New 3D schema logs (step, bin_edges: LIST<double>, counts: LIST<int>)
+        # We'll compute total counts per step and show as a line; if legacy, fallback.
+        done = False
+        try:
+            sdf = con.execute("""
+                SELECT step, counts
+                FROM read_parquet(?)
+                WHERE step BETWEEN ? AND ?
+                ORDER BY step
+            """, [files, int(win_lo), int(win_hi)]).df()
+            if not sdf.empty and "counts" in sdf.columns:
+                # counts is a Python list per row; sum per step
+                totals = []
+                for _, r in sdf.iterrows():
+                    try:
+                        totals.append((int(r["step"]), int(np.sum(r["counts"] or []))))
+                    except Exception:
+                        totals.append((int(r["step"]), None))
+                tdf = pd.DataFrame(totals, columns=["step","total_counts"]).dropna()
+                if not tdf.empty:
+                    st.dataframe(tdf.head(300))
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=tdf["step"], y=tdf["total_counts"], mode="lines+markers", name="Σ counts"))
+                    fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
+                                      xaxis_title="step", yaxis_title="total spectral counts")
+                    st.plotly_chart(fig, use_container_width=True)
+                    done = True
+        except Exception:
+            pass
+
+        if not done:
+            # Legacy fallback
+            try:
+                df = con.execute("""
+                    SELECT step, w_dom, A_dom, phi_dom, AVG(F_local) AS F_mean
+                    FROM read_parquet(?)
+                    WHERE step BETWEEN ? AND ?
+                    GROUP BY step, w_dom, A_dom, phi_dom
+                    ORDER BY step
+                """, [files, int(win_lo), int(win_hi)]).df()
+                st.dataframe(df.head(300))
+                if not df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=df["step"], y=df["F_mean"], mode="lines+markers", name="F_mean"))
+                    fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
+                                      xaxis_title="step", yaxis_title="F_mean")
+                    st.plotly_chart(fig, use_container_width=True)
+            except Exception:
+                st.info("No readable spectra in either schema for this window.")
 
 # ---- World 3D ----
 with tab_world3d:
-    st.subheader("3D world (env & state)")
-    files_env   = get_files(prefix, run_id, "env",   prefer_manifest)
+    st.subheader("3D world (state)")
     files_state = get_files(prefix, run_id, "state", prefer_manifest)
 
-    env_df = pd.DataFrame()
-    if files_env:
-        env_df = con.execute("""
-            SELECT step, t, x, y, z, value
-            FROM read_parquet(?)
-            WHERE step BETWEEN ? AND ?
-        """, [files_env, int(win_lo), int(win_hi)]).df()
-
+    # New 3D state schema: (step, x, y, z, value)
     state_df = pd.DataFrame()
     if files_state:
-        state_df = con.execute("""
-            SELECT step, x, y, z, m, T_eff
-            FROM read_parquet(?)
-            WHERE step BETWEEN ? AND ?
-        """, [files_state, int(win_lo), int(win_hi)]).df()
+        ok = False
+        try:
+            state_df = con.execute("""
+                SELECT step, x, y, z, value
+                FROM read_parquet(?)
+                WHERE step BETWEEN ? AND ?
+            """, [files_state, int(win_lo), int(win_hi)]).df()
+            if not state_df.empty and set(["x","y","z","value"]).issubset(state_df.columns):
+                ok = True
+        except Exception:
+            pass
+
+        if not ok:
+            # Legacy fallback: (step, x, y, z, m, T_eff) etc — try to map m→value if present
+            try:
+                state_df = con.execute("""
+                    SELECT step, x, y, z, m AS value
+                    FROM read_parquet(?)
+                    WHERE step BETWEEN ? AND ?
+                """, [files_state, int(win_lo), int(win_hi)]).df()
+            except Exception:
+                state_df = pd.DataFrame()
 
     # Controls
-    cA, cB, cC = st.columns([1,1,1])
+    cA, cB = st.columns([1,1])
     with cA:
-        color_by = st.selectbox("Color by", ["T_eff","m"], index=0)
+        color_by = st.selectbox("Color by", ["value"], index=0)
     with cB:
         max_points = st.number_input("Max points", min_value=1000, value=50000, step=5000,
                                      help="Downsample to keep UI responsive")
-    with cC:
-        show_env = st.toggle("Show env points", value=False)
 
-    if env_df.empty and state_df.empty:
-        st.info("No env/state data in the selected window.")
+    if state_df.empty:
+        st.info("No state data in the selected window.")
     else:
         # Downsample
-        rnd = np.random.default_rng(0)
-        if not state_df.empty and len(state_df) > max_points:
+        if len(state_df) > max_points:
             state_df = state_df.sample(int(max_points), random_state=0)
-        if not env_df.empty and len(env_df) > max_points:
-            env_df = env_df.sample(int(max_points), random_state=0)
 
         fig = go.Figure()
-        if show_env and not env_df.empty:
-            fig.add_trace(go.Scatter3d(
-                x=env_df["x"], y=env_df["y"], z=env_df["z"],
-                mode="markers", marker=dict(size=2, opacity=0.35),
-                name="env(value)"
-            ))
-        if not state_df.empty:
-            # size scale uses 'm' and stays >0
-            mmax = max(1e-9, float(state_df["m"].max()))
-            size = 3 + 6*(state_df["m"]/mmax)
-            color = state_df[color_by]
-            fig.add_trace(go.Scatter3d(
-                x=state_df["x"], y=state_df["y"], z=state_df["z"],
-                mode="markers",
-                marker=dict(size=size, color=color, colorscale="Viridis", showscale=True,
-                            colorbar=dict(title=color_by)),
-                name=f"state({color_by})"
-            ))
+        vmax = max(1e-9, float(state_df[color_by].max()))
+        size = 3 + 6*(state_df[color_by]/vmax)
+        color = state_df[color_by]
+        fig.add_trace(go.Scatter3d(
+            x=state_df["x"], y=state_df["y"], z=state_df["z"],
+            mode="markers",
+            marker=dict(size=size, color=color, colorscale="Viridis", showscale=True,
+                        colorbar=dict(title=color_by)),
+            name=f"state({color_by})"
+        ))
         fig.update_layout(height=600, scene=dict(aspectmode="data"),
                           margin=dict(l=10,r=10,t=30,b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 # ---- Edges 3D ----
 with tab_edges3d:
-    st.subheader("Catalyst edges (transfers)")
+    st.subheader("Gradient edges")
     files_edges = get_files(prefix, run_id, "edges", prefer_manifest)
-    files_state = get_files(prefix, run_id, "state", prefer_manifest)
 
     if not files_edges:
         st.info("No edges_* shards yet.")
     else:
-        edges_df = con.execute("""
-            SELECT step, src_conn, dst_conn, weight, t, x AS xs, y AS ys, z AS zs
-            FROM read_parquet(?)
-            WHERE step BETWEEN ? AND ?
-        """, [files_edges, int(win_lo), int(win_hi)]).df()
-
-        if files_state:
-            sd = con.execute("""
-                SELECT step, conn_id, x AS xd, y AS yd, z AS zd
+        # New 3D edges schema: x0,y0,z0,v0,x1,y1,z1,v1
+        drawn = False
+        try:
+            edges_df = con.execute("""
+                SELECT step, x0, y0, z0, x1, y1, z1, v0, v1
                 FROM read_parquet(?)
                 WHERE step BETWEEN ? AND ?
-            """, [files_state, int(win_lo), int(win_hi)]).df()
-        else:
-            sd = pd.DataFrame()
-
-        if edges_df.empty or sd.empty:
-            st.info("Edges exist but insufficient state to map coordinates in this window.")
-        else:
-            # latest position of each conn_id up to current window high
-            sd_latest = sd.sort_values("step").groupby("conn_id").tail(1).set_index("conn_id")
-            seg_rows = []
-            for _, r in edges_df.iterrows():
-                if r["dst_conn"] in sd_latest.index:
-                    dst = sd_latest.loc[r["dst_conn"]]
-                    seg_rows.append((
-                        float(r["xs"]), float(r["ys"]), float(r["zs"]),
-                        float(dst["xd"]), float(dst["yd"]), float(dst["zd"]),
-                        float(r["weight"])
-                    ))
-            if not seg_rows:
-                st.info("No mappable edges in this window.")
-            else:
-                seg = pd.DataFrame(seg_rows, columns=["x1","y1","z1","x2","y2","z2","w"])
-                # downsample edges for speed
+            """, [files_edges, int(win_lo), int(win_hi)]).df()
+            if not edges_df.empty and set(["x0","y0","z0","x1","y1","z1"]).issubset(edges_df.columns):
                 max_lines = st.number_input("Max edges to draw", 200, 20000, 3000, step=500)
-                draw = seg if len(seg) <= max_lines else seg.sample(int(max_lines), random_state=0)
-                wmax = max(1e-9, float(draw["w"].max()))
+                draw = edges_df if len(edges_df) <= max_lines else edges_df.sample(int(max_lines), random_state=0)
                 fig = go.Figure()
+                # Width proportional to source value if available
+                if "v0" in draw.columns:
+                    v0max = max(1e-9, float(draw["v0"].max()))
+                else:
+                    v0max = 1.0
                 for _, s in draw.iterrows():
+                    w = 2 + (6 * (float(s.get("v0", 1.0)) / v0max))
                     fig.add_trace(go.Scatter3d(
-                        x=[s.x1, s.x2], y=[s.y1, s.y2], z=[s.z1, s.z2],
-                        mode="lines", line=dict(width=2 + 6*(s.w/wmax)),
-                        showlegend=False
+                        x=[s.x0, s.x1], y=[s.y0, s.y1], z=[s.z0, s.z1],
+                        mode="lines", line=dict(width=w), showlegend=False
                     ))
                 fig.update_layout(height=600, scene=dict(aspectmode="data"),
                                   margin=dict(l=10,r=10,t=30,b=10))
                 st.plotly_chart(fig, use_container_width=True)
+                drawn = True
+        except Exception:
+            pass
+
+        if not drawn:
+            # Legacy fallback: join using conn ids (as your original code)
+            try:
+                files_state = get_files(prefix, run_id, "state", prefer_manifest)
+                edges_df = con.execute("""
+                    SELECT step, src_conn, dst_conn, weight, t, x AS xs, y AS ys, z AS zs
+                    FROM read_parquet(?)
+                    WHERE step BETWEEN ? AND ?
+                """, [files_edges, int(win_lo), int(win_hi)]).df()
+
+                if files_state:
+                    sd = con.execute("""
+                        SELECT step, conn_id, x AS xd, y AS yd, z AS zd
+                        FROM read_parquet(?)
+                        WHERE step BETWEEN ? AND ?
+                    """, [files_state, int(win_lo), int(win_hi)]).df()
+                else:
+                    sd = pd.DataFrame()
+
+                if edges_df.empty or sd.empty:
+                    st.info("Edges exist but insufficient state to map coordinates in this window.")
+                else:
+                    sd_latest = sd.sort_values("step").groupby("conn_id").tail(1).set_index("conn_id")
+                    seg_rows = []
+                    for _, r in edges_df.iterrows():
+                        if r["dst_conn"] in sd_latest.index:
+                            dst = sd_latest.loc[r["dst_conn"]]
+                            seg_rows.append((
+                                float(r["xs"]), float(r["ys"]), float(r["zs"]),
+                                float(dst["xd"]), float(dst["yd"]), float(dst["zd"]),
+                                float(r["weight"])
+                            ))
+                    if not seg_rows:
+                        st.info("No mappable edges in this window.")
+                    else:
+                        seg = pd.DataFrame(seg_rows, columns=["x1","y1","z1","x2","y2","z2","w"])
+                        max_lines = st.number_input("Max edges to draw", 200, 20000, 3000, step=500)
+                        draw = seg if len(seg) <= max_lines else seg.sample(int(max_lines), random_state=0)
+                        wmax = max(1e-9, float(draw["w"].max()))
+                        fig = go.Figure()
+                        for _, s in draw.iterrows():
+                            fig.add_trace(go.Scatter3d(
+                                x=[s.x1, s.x2], y=[s.y1, s.y2], z=[s.z1, s.z2],
+                                mode="lines", line=dict(width=2 + 6*(s.w/wmax)),
+                                showlegend=False
+                            ))
+                        fig.update_layout(height=600, scene=dict(aspectmode="data"),
+                                          margin=dict(l=10,r=10,t=30,b=10))
+                        st.plotly_chart(fig, use_container_width=True)
+            except Exception:
+                st.info("No readable edges in either schema for this window.")
 
 # ---- Diagnostics ----
 with tab_diag:
@@ -392,7 +532,7 @@ with tab_diag:
 
     st.divider()
     st.subheader("Raw indices / file lists")
-    for t in ["events","spectra","state","ledger","edges","env"]:
+    for t in ["events","spectra","state","ledger","edges","env","catalysts"]:
         files = get_files(prefix, run_id, t, prefer_manifest)
         st.write(f"**{t}**: {len(files)} files")
         if files:
