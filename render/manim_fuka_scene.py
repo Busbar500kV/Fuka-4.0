@@ -3,191 +3,177 @@ from __future__ import annotations
 
 import os
 import math
-import numpy as np
-from typing import Dict, Tuple
+import random
+import colorsys
+from typing import Tuple, Iterable
 
+import numpy as np
 from manim import (
-    Scene, ThreeDScene, ORIGIN, BLUE, YELLOW, WHITE,
-    Dot3D, Line3D, VGroup, config, FadeIn, FadeOut
+    Scene, ThreeDScene, Dot3D, Line3D, VGroup,
+    ORIGIN, config
 )
 
-# -------- helpers --------
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
     except Exception:
-        return default
+        return float(default)
 
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
     except Exception:
-        return default
+        return int(default)
 
 def _env_bool(name: str, default: bool) -> bool:
-    v = os.environ.get(name)
+    v = os.environ.get(name, None)
     if v is None:
         return default
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(v).strip().lower() in ("1","true","yes","y","on")
 
-def _downsample_idx(n: int, k: int, seed: int = 0) -> np.ndarray:
-    """return indices [0..n) of size <= k (random sample if needed)."""
-    n = int(n)
-    k = int(k)
+def _normalize(vals: np.ndarray) -> np.ndarray:
+    vmin = float(np.nanmin(vals)) if vals.size else 0.0
+    vmax = float(np.nanmax(vals)) if vals.size else 1.0
+    if not math.isfinite(vmin) or not math.isfinite(vmax) or vmax <= vmin:
+        return np.zeros_like(vals, dtype=float)
+    return (vals - vmin) / (vmax - vmin)
+
+def _value_to_rgb_triplets(vals: np.ndarray) -> np.ndarray:
+    """
+    Map scalar in [0,1] to an RGB triplet using a simple HSV ramp
+    (blue→cyan→green→yellow→red). Returns shape (N,3) floats in [0,1].
+    """
+    v = np.clip(vals, 0.0, 1.0).astype(float)
+    # hue ∈ [0.0, 0.66] (blue→red)
+    hues = 0.66 * (1.0 - v)
+    rgbs = np.empty((v.shape[0], 3), dtype=float)
+    for i, h in enumerate(hues):
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        rgbs[i, 0] = r
+        rgbs[i, 1] = g
+        rgbs[i, 2] = b
+    return rgbs
+
+def _thin_indices(n: int, k: int) -> np.ndarray:
+    """Return up to k indices from range(n) deterministically (head+stride)."""
     if n <= k:
-        return np.arange(n, dtype=np.int32)
-    rng = np.random.default_rng(seed)
-    return np.sort(rng.choice(n, size=k, replace=False).astype(np.int32))
+        return np.arange(n, dtype=np.int64)
+    stride = max(1, n // k)
+    return np.arange(0, n, stride, dtype=np.int64)[:k]
 
-def _value_to_color(v: np.ndarray) -> np.ndarray:
-    """map scalar -> RGB via a simple blue→yellow ramp (0..1)."""
-    v = np.asarray(v, dtype=float)
-    if v.size == 0:
-        return np.zeros((0, 3))
-    m = np.nanmax(v)
-    if not np.isfinite(m) or m <= 1e-12:
-        t = np.zeros_like(v)
-    else:
-        t = np.clip(v / m, 0.0, 1.0)
-    # blue (0,0,1) to yellow (1,1,0)
-    r = t
-    g = t
-    b = 1.0 - t
-    return np.stack([r, g, b], axis=1)
-
-# -------- NPZ loader --------
-
-class FukaFrames:
-    """
-    Lightweight reader for NPZ files produced by pack_npz.
-    Supports:
-      - v3D: arrays 'steps' (int), 'state_x','state_y','state_z','state_value',
-             'state_idx' (exclusive prefix sums), optional edges_* and edges_idx
-      - legacy: flat arrays with 'row_step' to filter by step
-    """
-    def __init__(self, npz_path: str):
-        self.npz_path = npz_path
-        self.z = np.load(npz_path, allow_pickle=False)
-        self.mode = self._detect_mode()
-        self.steps = self._steps()
-
-    def _has_keys(self, *keys: str) -> bool:
-        return all(k in self.z.files for k in keys)
-
-    def _detect_mode(self) -> str:
-        if self._has_keys("steps", "state_x", "state_y", "state_z", "state_value"):
-            return "v3d"
-        elif self._has_keys("row_step", "x", "y", "z"):
-            return "legacy"
-        else:
-            raise ValueError(
-                f"Unrecognized NPZ schema for {self.npz_path}; keys={sorted(self.z.files)}"
-            )
-
-    def _steps(self) -> np.ndarray:
-        if self.mode == "v3d":
-            return self.z["steps"].astype(np.int64)
-        else:
-            return np.unique(self.z["row_step"].astype(np.int64))
-
-    def nframes(self) -> int:
-        return int(len(self.steps))
-
-    def state_for_step(self, step: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if self.mode == "v3d":
-            steps = self.z["steps"]
-            idx = self.z.get("state_idx")  # optional prefix sums per frame
-            x = self.z["state_x"]; y=self.z["state_y"]; z=self.z["state_z"]; v=self.z.get("state_value")
-            v = v if v is not None else np.ones_like(x)
-            if idx is not None:
-                i = int(np.searchsorted(steps, step))
-                if i >= len(steps) or steps[i] != step:
-                    return np.empty(0), np.empty(0), np.empty(0), np.empty(0)
-                lo = int(idx[i]); hi = int(idx[i+1]) if i+1 < len(idx) else len(x)
-                return x[lo:hi], y[lo:hi], z[lo:hi], v[lo:hi]
-            else:
-                # fallback: full arrays correspond to this lone step
-                return x, y, z, v
-        else:
-            rs = self.z["row_step"].astype(np.int64)
-            sel = (rs == int(step))
-            x = self.z["x"][sel]; y=self.z["y"][sel]; z=self.z["z"][sel]
-            v = self.z["value"][sel] if "value" in self.z.files else np.ones_like(x)
-            return x, y, z, v
-
-    def edges_for_step(self, step: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if self.mode == "v3d":
-            if not self._has_keys("edges_x0","edges_y0","edges_z0","edges_x1","edges_y1","edges_z1"):
-                return tuple(np.empty(0) for _ in range(6))
-            steps = self.z["steps"]
-            idx = self.z.get("edges_idx")
-            x0=self.z["edges_x0"]; y0=self.z["edges_y0"]; z0=self.z["edges_z0"]
-            x1=self.z["edges_x1"]; y1=self.z["edges_y1"]; z1=self.z["edges_z1"]
-            if idx is not None:
-                i = int(np.searchsorted(steps, step))
-                if i >= len(steps) or steps[i] != step:
-                    return tuple(np.empty(0) for _ in range(6))
-                lo = int(idx[i]); hi = int(idx[i+1]) if i+1 < len(idx) else len(x0)
-                return x0[lo:hi], y0[lo:hi], z0[lo:hi], x1[lo:hi], y1[lo:hi], z1[lo:hi]
-            else:
-                return x0, y0, z0, x1, y1, z1
-        else:
-            # legacy has no edges in the NPZ normally
-            return tuple(np.empty(0) for _ in range(6))
-
-# -------- Manim scene --------
-
+# -----------------------------
+# Scene
+# -----------------------------
 class FukaWorldEdges3D(ThreeDScene):
-    def construct(self):
-        npz_path = os.environ.get("FUKA_NPZ", "")
-        if not npz_path or not os.path.exists(npz_path):
-            raise FileNotFoundError(f"FUKA_NPZ not found: {npz_path}")
+    """
+    Reads NPZ built by fuka.render.pack_npz and animates points + edges per step.
 
-        step_seconds = _env_float("FUKA_STEP_SECONDS", 0.20)
+    Expected arrays (flat, row-per-record):
+      steps:           (S,)
+      state_step:      (Ns,)
+      state_x/y/z/v:   (Ns,)
+      edges_step:      (Ne,)
+      x0,y0,z0,x1,y1,z1,v0,v1: (Ne,)
+    """
+
+    def construct(self):
+        npz_path = os.environ.get("FUKA_NPZ", "").strip()
+        if not npz_path or not os.path.isfile(npz_path):
+            raise FileNotFoundError(f"FUKA_NPZ not set or file not found: {npz_path}")
+
+        step_seconds = _env_float("FUKA_STEP_SECONDS", 0.2)
         max_points   = _env_int("FUKA_MAX_POINTS", 80000)
         max_edges    = _env_int("FUKA_MAX_EDGES", 20000)
-        point_r      = _env_float("FUKA_POINT_RADIUS", 0.035)
-        edge_w       = _env_float("FUKA_EDGE_WIDTH", 2.5)
+
+        point_radius = _env_float("FUKA_POINT_RADIUS", 0.035)
+        edge_width   = _env_float("FUKA_EDGE_WIDTH", 2.5)
         show_edges   = _env_bool("FUKA_SHOW_EDGES", True)
 
-        frames = FukaFrames(npz_path)
-        n = frames.nframes()
-        if n == 0:
-            return
+        # Make camera a bit nicer
+        self.set_camera_orientation(phi=65 * math.pi/180, theta=45 * math.pi/180)
 
-        # camera defaults
-        self.set_camera_orientation(phi=70*math.pi/180, theta=45*math.pi/180)
+        data = np.load(npz_path, allow_pickle=False)
 
-        for i, step in enumerate(frames.steps):
-            # --- state points ---
-            x, y, z, val = frames.state_for_step(int(step))
+        steps = data["steps"].astype(np.int64)
+        # state
+        s_step = data["state_step"].astype(np.int64)
+        sx = data["state_x"].astype(float)
+        sy = data["state_y"].astype(float)
+        sz = data["state_z"].astype(float)
+        sv = data["state_value"].astype(float)
+        # edges
+        e_step = data["edges_step"].astype(np.int64)
+        x0 = data["x0"].astype(float); y0 = data["y0"].astype(float); z0 = data["z0"].astype(float)
+        x1 = data["x1"].astype(float); y1 = data["y1"].astype(float); z1 = data["z1"].astype(float)
+        v0 = data["v0"].astype(float); v1 = data["v1"].astype(float)
+
+        # Global normalization for stable colors across frames
+        svn = _normalize(sv)
+        v0n = _normalize(v0)
+
+        # Build per-step index lookups
+        from collections import defaultdict
+        idx_state = defaultdict(list)
+        for i, st in enumerate(s_step):
+            idx_state[int(st)].append(i)
+        idx_edges = defaultdict(list)
+        for i, st in enumerate(e_step):
+            idx_edges[int(st)].append(i)
+
+        # Main animation: for each step, draw a cloud + optional lines; replace each frame
+        cur_group = VGroup()
+
+        for st in steps:
+            st = int(st)
+            self.clear()         # ensure previous frame is cleared from the scene graph
+            self.remove(cur_group)
             pts = VGroup()
-            if x.size:
-                keep = _downsample_idx(x.size, max_points, seed=int(step) & 0xFFFF)
-                xs, ys, zs = x[keep], y[keep], z[keep]
-                cols = _value_to_color(val[keep])
+            seg = VGroup()
+
+            # ---- STATE POINTS ----
+            sidx = np.array(idx_state.get(st, []), dtype=np.int64)
+            if sidx.size:
+                # downsample if needed
+                sidx = _thin_indices(int(sidx.size), max_points).astype(np.int64)
+                xs = sx[sidx]; ys = sy[sidx]; zs = sz[sidx]
+                valn = svn[sidx]  # normalized 0..1
+                cols = _value_to_rgb_triplets(valn)
+
+                # Draw points
                 for j in range(xs.shape[0]):
                     d = Dot3D(point=(float(xs[j]), float(ys[j]), float(zs[j])))
-                    rgb = cols[j]; d.set_color((float(rgb[0]), float(rgb[1]), float(rgb[2])))
-                    d.radius = point_r
+                    rgb = tuple(map(float, cols[j]))   # (r,g,b) floats
+                    d.set_fill(rgb, opacity=1.0)       # use fill for Dot3D
+                    d.set_stroke(rgb, width=0.0, opacity=0.0)
+                    d.radius = point_radius
                     pts.add(d)
 
-            # --- edges ---
-            segs = VGroup()
+            # ---- EDGES ----
             if show_edges:
-                x0,y0,z0,x1,y1,z1 = frames.edges_for_step(int(step))
-                if x0.size:
-                    keep = _downsample_idx(x0.size, max_edges, seed=(int(step)+12345) & 0xFFFF)
-                    for j in keep:
-                        segs.add(Line3D(
-                            start=(float(x0[j]), float(y0[j]), float(z0[j])),
-                            end  =(float(x1[j]), float(y1[j]), float(z1[j])),
-                            thickness=edge_w
-                        ))
+                eidx = np.array(idx_edges.get(st, []), dtype=np.int64)
+                if eidx.size:
+                    eidx = _thin_indices(int(eidx.size), max_edges).astype(np.int64)
+                    x0s = x0[eidx]; y0s = y0[eidx]; z0s = z0[eidx]
+                    x1s = x1[eidx]; y1s = y1[eidx]; z1s = z1[eidx]
+                    wv  = v0n[eidx]  # weight/color based on src value
+                    cols = _value_to_rgb_triplets(wv)
+                    for j in range(x0s.shape[0]):
+                        line = Line3D(
+                            start=(float(x0s[j]), float(y0s[j]), float(z0s[j])),
+                            end=(float(x1s[j]), float(y1s[j]), float(z1s[j])),
+                        )
+                        rgb = tuple(map(float, cols[j]))
+                        line.set_stroke(rgb, width=edge_width)
+                        seg.add(line)
 
-            # animate: fade in → hold → fade out
-            grp = VGroup(pts, segs)
-            self.add(grp)
+            cur_group = VGroup(pts, seg)
+            self.add(cur_group)
+
+            # hold for step duration (convert seconds → Manim run_time)
             self.wait(step_seconds)
-            self.remove(grp)
+
+        # End
+        self.wait(0.1)
