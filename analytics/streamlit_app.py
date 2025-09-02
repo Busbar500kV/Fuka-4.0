@@ -203,15 +203,15 @@ frame_lo, frame_hi = int(step_min), int(step_max)
 
 # Server-driven animation: bump frame and rerun only when playing
 if st.session_state.playing:
-    # small sleep to pace FPS
     time.sleep(1.0/max(1,fps))
     nxt = int(st.session_state.frame_step) + int(stride)
     if nxt > frame_hi:
         nxt = frame_lo
     st.session_state.frame_step = int(nxt)
-    # optional soft auto-refresh to catch new shards even if not re-rendering panel data
+    # soft auto-refresh to catch new shards / update panel
     if live_refresh:
-        st.experimental_rerun()
+        st.rerun()   # <-- FIX: use st.rerun() (experimental_rerun removed)
+
 frame = int(st.session_state.frame_step)
 
 st.caption(f"Range: [{frame_lo}, {frame_hi}] | fps={fps} | stride={stride} | panel={panel} | live={live_refresh}")
