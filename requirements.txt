@@ -1,13 +1,7 @@
-# Core data + UI
-numpy>=1.26
-pandas>=2.2
-pyarrow>=14
-duckdb>=1.0
-plotly>=5.22
-streamlit>=1.36
-
-# 3D rendering (Manim OpenGL renderer)
-manim==0.19.0
-moderngl>=5.6
-glfw>=2.6
-PyOpenGL>=3.1
+# Streamlit/UI deps only. No OpenGL/Manim here.
+numpy>=1.26,<3
+pandas>=2.2,<3
+pyarrow>=14,<22
+duckdb>=1.0,<2
+plotly>=5.22,<7
+streamlit>=1.36,<2
