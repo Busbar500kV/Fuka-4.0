@@ -2,88 +2,87 @@
 from __future__ import annotations
 
 import argparse
-import importlib
-import inspect
 import os
 import subprocess
-import sys
 from pathlib import Path
 
-def run(npz_path: str,
-        quality: str = "med",
-        fps: int = 12,
-        step_seconds: float = 0.20,
-        max_points: int = 80000,
-        max_edges: int = 20000,
-        disable_cache: bool = False,
-        scene_qual_name: str = "render.manim_fuka_scene.FukaWorldEdges3D",
-        media_dir: str | None = None) -> None:
+def run(
+    npz_path: str,
+    quality: str = "med",              # low|med|high
+    fps: int = 12,
+    step_seconds: float = 0.20,
+    max_points: int = 80000,
+    max_edges: int = 60000,
+    edge_width: float = 3.0,
+    point_radius: float = 0.05,
+    color_mode: str = "auto",          # auto|edge_strength|edge_deposit|edge_kappa|edge_value|point_value
+    color_key: str | None = None,      # explicit NPZ key to color by (edges)
+    points_color_key: str | None = None,# explicit NPZ key to color by (points)
+    phi_deg: float = 65.0,
+    theta_deg: float = -45.0,
+    zoom: float = 1.10,
+):
+    """
+    Shells out to manim to render render/manim_fuka_scene.py while passing options via env vars.
+    """
 
-    if not os.path.isfile(npz_path):
-        raise FileNotFoundError(f"NPZ not found: {npz_path}")
+    npz_path = str(Path(npz_path).expanduser().resolve())
+    scene_py = Path(__file__).resolve().parents[2] / "render" / "manim_fuka_scene.py"
+    if not scene_py.exists():
+        raise SystemExit(f"Scene file not found: {scene_py}")
 
-    # Split scene module/class
-    if scene_qual_name.count(".") < 1:
-        raise ValueError("scene_qual_name must be <module>.<Class>")
-    mod_name, cls_name = scene_qual_name.rsplit(".", 1)
-
-    # Import module to locate file path
-    mod = importlib.import_module(mod_name)
-    scene_file = inspect.getsourcefile(mod)
-    if not scene_file:
-        raise RuntimeError(f"Cannot locate source file for module {mod_name}")
-
-    repo_dir = os.environ.get("REPO_DIR", str(Path(scene_file).resolve().parents[1]))
-    scene_path = str(Path(scene_file).resolve())
-    media_dir = media_dir or str(Path(repo_dir) / "media_out")
-
-    Path(media_dir).mkdir(parents=True, exist_ok=True)
-
-    # Export env for the scene
     env = os.environ.copy()
     env["FUKA_NPZ"] = npz_path
-    env["FUKA_STEP_SECONDS"] = str(step_seconds)
-    env["FUKA_MAX_POINTS"] = str(max_points)
-    env["FUKA_MAX_EDGES"] = str(max_edges)
-    env.setdefault("FUKA_POINT_RADIUS", "0.035")
-    env.setdefault("FUKA_EDGE_WIDTH", "2.5")
-    env.setdefault("FUKA_SHOW_EDGES", "1")
+    env["FUKA_QUALITY"] = quality
+    env["FUKA_FPS"] = str(int(fps))
+    env["FUKA_STEP_SECONDS"] = str(float(step_seconds))
+    env["FUKA_MAX_POINTS"] = str(int(max_points))
+    env["FUKA_MAX_EDGES"] = str(int(max_edges))
+    env["FUKA_EDGE_WIDTH"] = str(float(edge_width))
+    env["FUKA_POINT_RADIUS"] = str(float(point_radius))
+    env["FUKA_COLOR_MODE"] = color_mode
+    if color_key:
+        env["FUKA_COLOR_KEY"] = color_key
+    if points_color_key:
+        env["FUKA_POINTS_COLOR_KEY"] = points_color_key
+    env["FUKA_CAM_PHI"] = str(float(phi_deg))
+    env["FUKA_CAM_THETA"] = str(float(theta_deg))
+    env["FUKA_CAM_ZOOM"] = str(float(zoom))
 
-    # quality flags
+    # choose manim quality flags
     qflag = {"low": "-ql", "med": "-qm", "high": "-qh"}.get(quality, "-qm")
-    cache_flag = "--disable_caching" if disable_cache else ""
-
-    # Output name based on NPZ
-    stem = Path(npz_path).with_suffix("").name
-    out_name = f"{stem}.mp4"
 
     cmd = [
-        sys.executable, "-m", "manim", scene_path,
+        "manim",
         qflag,
-        cache_flag,
+        "-v", "WARNING",
         "--fps", str(int(fps)),
-        "--media_dir", media_dir,
-        "-o", out_name,
-        cls_name,
+        str(scene_py),
+        "FukaScene",
     ]
-    # Remove empty args (cache_flag may be '')
-    cmd = [c for c in cmd if c]
+    print("[fuka:render] running:", " ".join(cmd))
+    rc = subprocess.call(cmd, env=env)
+    if rc != 0:
+        raise SystemExit(rc)
 
-    print("[render_manim] exec:", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True, env=env)
-
-def main(argv: list[str] | None = None) -> int:
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--npz", required=True)
-    ap.add_argument("--quality", default="med", choices=["low","med","high"])
+    ap.add_argument("npz", help="Path to packed NPZ from pack_npz.py")
+    ap.add_argument("--quality", default="med", choices=["low", "med", "high"])
     ap.add_argument("--fps", type=int, default=12)
-    ap.add_argument("--step_seconds", type=float, default=0.20)
-    ap.add_argument("--max_points", type=int, default=80000)
-    ap.add_argument("--max_edges", type=int, default=20000)
-    ap.add_argument("--disable_cache", action="store_true")
-    ap.add_argument("--scene", default="render.manim_fuka_scene.FukaWorldEdges3D")
-    ap.add_argument("--media_dir", default=None)
-    args = ap.parse_args(argv)
+    ap.add_argument("--step-seconds", type=float, default=0.20)
+    ap.add_argument("--max-points", type=int, default=80000)
+    ap.add_argument("--max-edges", type=int, default=60000)
+    ap.add_argument("--edge-width", type=float, default=3.0)
+    ap.add_argument("--point-radius", type=float, default=0.05)
+    ap.add_argument("--color-mode", default="auto",
+                    choices=["auto","edge_strength","edge_deposit","edge_kappa","edge_value","point_value"])
+    ap.add_argument("--color-key", default=None, help="Explicit NPZ key for edge colors")
+    ap.add_argument("--points-color-key", default=None, help="Explicit NPZ key for point colors")
+    ap.add_argument("--phi", type=float, default=65.0)
+    ap.add_argument("--theta", type=float, default=-45.0)
+    ap.add_argument("--zoom", type=float, default=1.10)
+    args = ap.parse_args()
 
     run(
         npz_path=args.npz,
@@ -92,11 +91,15 @@ def main(argv: list[str] | None = None) -> int:
         step_seconds=args.step_seconds,
         max_points=args.max_points,
         max_edges=args.max_edges,
-        disable_cache=args.disable_cache,
-        scene_qual_name=args.scene,
-        media_dir=args.media_dir,
+        edge_width=args.edge_width,
+        point_radius=args.point_radius,
+        color_mode=args.color_mode,
+        color_key=args.color_key,
+        points_color_key=args.points_color_key,
+        phi_deg=args.phi,
+        theta_deg=args.theta,
+        zoom=args.zoom,
     )
-    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
