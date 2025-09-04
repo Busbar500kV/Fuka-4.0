@@ -151,7 +151,13 @@ class FukaScene(ThreeDScene):
         norm = _make_normalizer(all_pts, pad=0.5, target_half=3.0)
 
         # ---- camera ----
-        self.set_camera_orientation(phi=CAM_PHI, theta=CAM_THETA, zoom=CAM_ZOOM)
+        self.set_camera_orientation(phi=CAM_PHI, theta=CAM_THETA)  # OpenGLCamera has no set_zoom()
+        if abs(CAM_ZOOM - 1.0) > 1e-6:
+            # Zoom in/out by scaling the view frame; >1.0 means "closer"
+            try:
+                self.renderer.camera.frame.scale(1.0 / CAM_ZOOM)
+            except Exception:
+                pass  # stay robust across manim variants
 
         # Optional bounds cube/axes (comment out if undesired)
         # from manim import Cube, ThreeDAxes
