@@ -1,0 +1,11 @@
+# Render/headless dependencies for Fuka 4.0
+# This file includes the base UI deps, plus all renderer-specific extras.
+
+# Pull in the base Streamlit/UI dependencies
+-r requirements.txt
+
+# 3D rendering (Manim OpenGL renderer stack)
+manim==0.19.0
+moderngl>=5.6
+glfw>=2.6
+PyOpenGL>=3.1
