@@ -243,5 +243,20 @@ class FukaScene(ThreeDScene):
                     edges_group.add(seg)
 
             new_frame = VGroup(edges_group, pts_group)
-            g.become(new_frame)
+
+            # --- OpenGL-safe swap (avoid .become on changing submobject structure) ---
+            if fi == 0:
+                g = new_frame
+                self.add(g)
+            else:
+                # remove old group and add fresh group to avoid OpenGL become() issue
+                self.remove(g)
+                g = new_frame
+                self.add(g)
+            
             self.wait(STEP_SECS)
+
+
+
+
+
