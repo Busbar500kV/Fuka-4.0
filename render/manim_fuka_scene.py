@@ -184,6 +184,7 @@ class FukaScene(ThreeDScene):
                 KDTree = None
                 use_kdtree = False
 
+        print(f"[FUKA] frames={F} max_points={MAX_POINTS} max_edges={MAX_EDGES}", flush=True)
         for fi in range(F):
             # ----- points (state) -----
             slo, shi = int(sidx[fi]), int(sidx[fi+1])
@@ -198,6 +199,7 @@ class FukaScene(ThreeDScene):
 
             # ----- edges -----
             elo, ehi = int(eidx[fi]), int(eidx[fi+1])
+            print(f"[FUKA] frame {fi}: points={shi-slo} edges={ehi-elo}", flush=True)
             edges_group = VGroup()
             if isinstance(ex0, np.ndarray) and ehi > elo:
                 pick = downsample(ehi - elo, MAX_EDGES) + elo
