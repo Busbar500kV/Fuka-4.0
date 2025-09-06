@@ -235,4 +235,9 @@ class Engine:
                                  boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius,
                                  catalysts_enabled=int(self.ccfg.enabled))
 
+        try:
+            self.observer.finalize({"rho_last": float(rho) if 'rho' in locals() else 0.0})
+        except Exception:
+            pass
+
         self.rec.finalize()
