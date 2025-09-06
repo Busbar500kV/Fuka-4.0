@@ -71,6 +71,43 @@ class Engine:
         )
         self.catalysts = CatalystsSystem(self.world, self.ccfg)
 
+        # ---- NEW: external source / guess field / bath / observer ----
+        ext_cfg = self.cfg.get("external_source", {})
+        self.ext = ExternalSource(self.world, ExternalSourceCfg(
+            enabled=bool(ext_cfg.get("enabled", True)),
+            pulses=ext_cfg.get("pulses", []),
+            clip=float(ext_cfg.get("clip", 2.0)),
+        ))
+        
+        gf_cfg = self.cfg.get("guess_field", {})
+        self.guess = GuessField(self.world, GuessFieldCfg(
+            enabled=bool(gf_cfg.get("enabled", True)),
+            eta=float(gf_cfg.get("eta", 0.2)),
+            decay=float(gf_cfg.get("decay", 0.05)),
+            diffuse=float(gf_cfg.get("diffuse", 0.02)),
+            s0=float(gf_cfg.get("s0", 0.5)),
+            sigma_c=float(gf_cfg.get("sigma_c", 3.0)),
+            sigma_reward=float(gf_cfg.get("sigma_reward", 1.5)),
+            beta_jitter=float(gf_cfg.get("beta_jitter", 2.0)),
+        ), harvest_mask=None)
+        
+        bath_cfg = self.cfg.get("bath", {})
+        self.bath = BathCfg(
+            enabled=bool(bath_cfg.get("enabled", True)),
+            mode=str(bath_cfg.get("mode", "energy")),
+            kappa=float(bath_cfg.get("kappa", 0.02)),
+            rho_max=float(bath_cfg.get("rho_max", 0.05)),
+        )
+        
+        obs_cfg = self.cfg.get("observer", {})
+        # recorder exposes run_dir path; we keep it as-is
+        run_dir = Path(self.rec.run_dir) if hasattr(self.rec, "run_dir") else Path(".")
+        self.observer = Observer(self.world, ObserverCfg(
+            enabled=bool(obs_cfg.get("enabled", True)),
+            lambda_edge=float(obs_cfg.get("lambda_edge", 0.98)),
+        ), out_dir=run_dir)
+
+
         # IO knobs
         io = self.cfg.get("io", {})
         self.state_topk = int(io.get("state_topk", 256))
@@ -114,13 +151,40 @@ class Engine:
                          catalysts_enabled=int(self.ccfg.enabled))
 
         for step in range(1, self.steps + 1):
-            # background field update
+            # 0) external pulses (time-varying source)
+            try:
+                self.ext.step(step)
+            except Exception:
+                pass  # never break a run
+            
+            # 1) top-down catalyst guess (DishBrain-style structured vs noisy)
+            try:
+                self.guess.step(step, k_fires=1)
+            except Exception:
+                pass
+            
+            # 2) background field update (unchanged physics)
             stats = step_diffuse(self.world)
-
-            # catalysts update + deposit
+            
+            # 3) global bath dissipation (existence coupling)
+            try:
+                rho = step_bath(self.world, self.bath)
+                # let guess field see post-bath energy for reward/penalty update
+                self.guess.post_bath_update()
+            except Exception:
+                rho = 0.0
+            
+            # 4) existing wandering catalysts (as before)
             cat_totals = {"spawned": 0, "alive": 0, "total_deposit": 0.0}
             if self.ccfg.enabled:
                 cat_totals = self.catalysts.update()
+            
+            # 5) intrinsic observer accumulation
+            try:
+                self.observer.step()
+            except Exception:
+                pass
+
 
             # ledger (rollups)
             self.rec.log_ledger(step=step, **stats, cat_alive=int(cat_totals["alive"]),
