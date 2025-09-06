@@ -281,3 +281,9 @@ class CatalystsSystem:
                 self._spawn_one(); spawned += 1
 
         return {"spawned": spawned, "alive": len(self.pos), "total_deposit": float(total_deposit)}
+
+# ---- additive helper for observer/flux math (non-breaking) ----
+def get_alpha(cfg: PhysicsCfg) -> float:
+    """Return the numeric diffusion blend in [0,1] as used by step_diffuse."""
+    import numpy as np
+    return float(np.clip(cfg.flux_limit, 0.0, 1.0))
