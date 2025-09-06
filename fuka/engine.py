@@ -1,6 +1,11 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple
 import numpy as np
+from .external_source import ExternalSource, ExternalSourceCfg
+from .bath import step_bath, BathCfg
+from .guess_field import GuessField, GuessFieldCfg
+from .observer import Observer, ObserverCfg
+from pathlib import Path
 
 from .physics import (
     World3D, PhysicsCfg, step_diffuse, detect_local_maxima,
