@@ -2,6 +2,10 @@
   "run_name": "FUKA_4_0_3D",
   "steps": 3000,
 
+  "time": {
+    "dt_seconds": 0.0001
+  },
+
   "world": {
     "grid_shape": [96, 64, 48]
   },
@@ -26,6 +30,59 @@
     "reflect_at_boundary": true,
     "min_strength": 0.05,
     "deposit_clip": 2.0
+  },
+
+  "external_source": {
+    "enabled": true,
+    "clip": 2.0,
+
+    "sinusoids": [
+      {
+        "center": [48.0, 32.0, 24.0],
+        "amp": 0.8,
+        "freq_hz": 2.0,
+        "phase_deg": 0.0,
+        "sigma": 3.0,
+        "t_on": 0,
+        "t_off": 3000
+      },
+      {
+        "center": [48.0, 32.0, 24.0],
+        "amp": 0.3,
+        "freq_hz": 20.0,
+        "phase_deg": 45.0,
+        "sigma": 3.0,
+        "t_on": 0,
+        "t_off": 3000
+      }
+    ],
+
+    "pulses": [
+      [0, 0, 48.0, 32.0, 24.0, 0.7, 3.0]
+    ]
+  },
+
+  "bath": {
+    "enabled": true,
+    "mode": "energy",
+    "kappa": 0.02,
+    "rho_max": 0.05
+  },
+
+  "guess_field": {
+    "enabled": true,
+    "eta": 0.2,
+    "decay": 0.05,
+    "diffuse": 0.02,
+    "s0": 0.5,
+    "sigma_c": 3.0,
+    "sigma_reward": 1.5,
+    "beta_jitter": 2.0
+  },
+
+  "observer": {
+    "enabled": true,
+    "lambda_edge": 0.98
   },
 
   "io": {
