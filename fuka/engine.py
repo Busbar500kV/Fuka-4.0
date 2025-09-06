@@ -72,12 +72,24 @@ class Engine:
         self.catalysts = CatalystsSystem(self.world, self.ccfg)
 
         # ---- NEW: external source / guess field / bath / observer ----
+        time_cfg = self.cfg.get("time", {})
+        dt_seconds = float(time_cfg.get("dt_seconds", 0.001))  # default 1 ms/step
+        
         ext_cfg = self.cfg.get("external_source", {})
-        self.ext = ExternalSource(self.world, ExternalSourceCfg(
-            enabled=bool(ext_cfg.get("enabled", True)),
-            pulses=ext_cfg.get("pulses", []),
-            clip=float(ext_cfg.get("clip", 2.0)),
-        ))
+        self.ext = ExternalSource(
+            self.world,
+            ExternalSourceCfg(
+                enabled=bool(ext_cfg.get("enabled", True)),
+                pulses=ext_cfg.get("pulses", []),
+                sinusoids=ext_cfg.get("sinusoids", []),
+                clip=float(ext_cfg.get("clip", 2.0)),
+                dt_seconds=dt_seconds,
+            )
+        )
+
+
+        
+       
         
         gf_cfg = self.cfg.get("guess_field", {})
         self.guess = GuessField(self.world, GuessFieldCfg(
