@@ -6,6 +6,8 @@ from .bath import step_bath, BathCfg
 from .guess_field import GuessField, GuessFieldCfg
 from .observer import Observer, ObserverCfg
 from pathlib import Path
+from .encoder import Encoder, EncoderCfg
+from pathlib import Path
 
 from .physics import (
     World3D, PhysicsCfg, step_diffuse, detect_local_maxima,
@@ -118,6 +120,21 @@ class Engine:
             enabled=bool(obs_cfg.get("enabled", True)),
             lambda_edge=float(obs_cfg.get("lambda_edge", 0.98)),
         ), out_dir=run_dir)
+        
+        encfg = self.cfg.get("encoder", {})
+        run_dir = Path(self.rec.run_dir) if hasattr(self.rec, "run_dir") else Path(".")
+        self.encoder = Encoder(
+            self.world,
+            EncoderCfg(
+                enabled=bool(encfg.get("enabled", True)),
+                eta=float(encfg.get("eta", 0.02)),
+                gamma=float(encfg.get("gamma", 0.02)),
+                lam=float(encfg.get("lam", 0.98)),
+                tau_encode=float(encfg.get("tau_encode", 0.05)),
+                save_every=int(encfg.get("save_every", 500))
+            ),
+            out_dir=run_dir
+        )
 
 
         # IO knobs
@@ -175,7 +192,10 @@ class Engine:
             except Exception:
                 pass
             
-            # 2) background field update (unchanged physics)
+            # 2.1) capture a copy of the field for pre-mix flux
+            E_pre = self.world.energy.copy()
+            
+            # 2.2) background field update (unchanged physics)
             stats = step_diffuse(self.world)
             
             # 3) global bath dissipation (existence coupling)
@@ -193,10 +213,15 @@ class Engine:
             
             # 5) intrinsic observer accumulation
             try:
+                # encoded connections update uses pre-mix field
+                self.encoder.step(E_pre)
+            except Exception:
+                pass
+            
+            try:
                 self.observer.step()
             except Exception:
                 pass
-
 
             # ledger (rollups)
             self.rec.log_ledger(step=step, **stats, cat_alive=int(cat_totals["alive"]),
@@ -252,4 +277,9 @@ class Engine:
         except Exception:
             pass
 
+        try:
+            self.encoder.save()
+        except Exception:
+            pass
+        
         self.rec.finalize()
