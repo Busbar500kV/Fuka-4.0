@@ -225,6 +225,95 @@ def cap_points(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
 ph_chart = st.empty()
 ph_table = st.empty()
 
+# ---------- Encoded-edges helpers (NEW) ----------
+import io
+import colorsys
+from pathlib import Path
+
+@st.cache_data(show_spinner=False)
+def http_bytes(url: str, ttl: int) -> Optional[bytes]:
+    """Download raw bytes from URL (for .npz)."""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.read()
+    except Exception:
+        return None
+
+def encoded_edges_url(prefix: str, run_id: str, live_token: Optional[int]) -> str:
+    # We publish encoded edges under runs/<run_id>/observer/encoded_edges.npz
+    base = f"{prefix}/runs/{run_id}/observer/encoded_edges.npz"
+    return _with_buster(base, live_token)
+
+@st.cache_data(show_spinner=False)
+def load_encoded_edges_npz(prefix: str, run_id: str, live_token: Optional[int], ttl: int):
+    """
+    Returns dict with Gx/Gy/Gz, Ex/Ey/Ez, Sx/Sy/Sz, Px/Py/Pz, tau (float)
+    or None if not available.
+    """
+    url = encoded_edges_url(prefix, run_id, live_token)
+    raw = http_bytes(url, ttl)
+    if not raw:
+        return None
+    try:
+        with np.load(io.BytesIO(raw)) as z:
+            out = {
+                "Gx": z["Gx"], "Gy": z["Gy"], "Gz": z["Gz"],
+                "Ex": z["Ex"], "Ey": z["Ey"], "Ez": z["Ez"],
+                "Sx": z["Sx"], "Sy": z["Sy"], "Sz": z["Sz"],
+                "Px": z["Px"], "Py": z["Py"], "Pz": z["Pz"],
+                "tau": float(z["tau_encode"]) if "tau_encode" in z else 0.05
+            }
+            return out
+    except Exception:
+        return None
+
+def _hsv_to_rgb_vec(H: np.ndarray, S: np.ndarray, V: np.ndarray) -> Tuple[np.ndarray,np.ndarray,np.ndarray]:
+    """
+    Vectorized HSV->RGB for arrays in [0,1]. Uses colorsys per-item (fast enough for capped edges).
+    Returns r,g,b in [0,1].
+    """
+    Hf = np.asarray(H).ravel(); Sf = np.asarray(S).ravel(); Vf = np.asarray(V).ravel()
+    rgb = [colorsys.hsv_to_rgb(float(h), float(s), float(v)) for h,s,v in zip(Hf,Sf,Vf)]
+    rgb = np.array(rgb, dtype=float)
+    R = rgb[:,0].reshape(H.shape); G = rgb[:,1].reshape(H.shape); B = rgb[:,2].reshape(H.shape)
+    return R,G,B
+
+def _build_axis_edges(mask: np.ndarray, axis: str) -> Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+    """
+    From a boolean mask of encoded edges on one axis, build arrays of x0,y0,z0,x1,y1,z1
+    using integer voxel coordinates (edge midpoints are nice, but lines look fine).
+    """
+    idx = np.argwhere(mask)
+    if idx.size == 0:
+        return (np.array([]),)*6
+    if axis == "x":
+        # mask shape (nx-1,ny,nz), edge from (x,y,z) -> (x+1,y,z)
+        x0 = idx[:,0].astype(float); y0 = idx[:,1].astype(float); z0 = idx[:,2].astype(float)
+        x1 = x0 + 1.0; y1 = y0;       z1 = z0
+    elif axis == "y":
+        # mask shape (nx,ny-1,nz), edge (x,y,z) -> (x,y+1,z)
+        x0 = idx[:,0].astype(float); y0 = idx[:,1].astype(float); z0 = idx[:,2].astype(float)
+        x1 = x0;       y1 = y0 + 1.0; z1 = z0
+    else:  # "z"
+        # mask shape (nx,ny,nz-1), edge (x,y,z) -> (x,y,z+1)
+        x0 = idx[:,0].astype(float); y0 = idx[:,1].astype(float); z0 = idx[:,2].astype(float)
+        x1 = x0;       y1 = y0;       z1 = z0 + 1.0
+    return x0,y0,z0,x1,y1,z1
+
+def _hsv_from_embeddings(G: np.ndarray, Eabs: np.ndarray, Esign: np.ndarray, P: np.ndarray) -> Tuple[np.ndarray,np.ndarray,np.ndarray]:
+    """
+    Color recipe:
+      Hue   ~ atan2(Esign, Eabs)  in [0,1]
+      Sat   ~ normalized persistence
+      Value ~ normalized G
+    """
+    # tiny eps to avoid div-by-zero
+    eps = 1e-9
+    H = (np.arctan2(Esign, Eabs + eps) / np.pi + 1.0) * 0.5
+    S = (P - P.min()) / (P.max() - P.min() + eps)
+    V = (G - G.min()) / (G.max() - G.min() + eps)
+    return H,S,V
+
 # ---------------- PANEL RENDERERS ----------------
 def render_overview():
     files_ledger = get_files(prefix, run_id, "ledger", prefer_manifest, live_token, ttl_val)
