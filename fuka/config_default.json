@@ -44,7 +44,7 @@
         "phase_deg": 0.0,
         "sigma": 3.0,
         "t_on": 0,
-        "t_off": 3000
+        "t_off": 1000
       },
       {
         "center": [48.0, 32.0, 24.0],
@@ -53,7 +53,7 @@
         "phase_deg": 45.0,
         "sigma": 3.0,
         "t_on": 0,
-        "t_off": 3000
+        "t_off": 1000
       }
     ],
 
@@ -95,11 +95,11 @@
   },
 
   "io": {
-    "flush_every": 2000,
+    "flush_every": 200,
     "state_topk": 400,
     "edges_topk": 800,
     "spectra_bins": 64,
     "event_threshold_sigma": 3.0,
-    "log_env_every": 1000
+    "log_env_every": 200
   }
 }
