@@ -1,6 +1,6 @@
 {
   "run_name": "FUKA_4_0_3D",
-  "steps": 3000,
+  "steps": 1000,
 
   "time": {
     "dt_seconds": 0.0001
@@ -83,6 +83,15 @@
   "observer": {
     "enabled": true,
     "lambda_edge": 0.98
+  },
+
+  "encoder": {
+    "enabled": true,
+    "eta": 0.02,
+    "gamma": 0.02,
+    "lam": 0.98,
+    "tau_encode": 0.05,
+    "save_every": 500
   },
 
   "io": {
