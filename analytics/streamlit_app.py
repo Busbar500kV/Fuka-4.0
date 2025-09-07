@@ -157,6 +157,13 @@ panel = st.sidebar.radio("Panel",
                              st.session_state.get("active_panel","World 3D")))
 st.session_state.active_panel = panel
 
+# Encoded-edges preference
+prefer_encoded_edges = st.sidebar.toggle(
+    "Edges 3D: show encoded connections (if available)",
+    value=True,
+    help="If encoded_edges.npz exists, draw only long-lived (G) edges with color-coded embeddings; otherwise fall back to instantaneous edges."
+)
+
 # Optional small trail for World 3D (in *steps*, not frames)
 world_trail_steps = st.sidebar.number_input("World 3D trail (previous steps)", min_value=0,
                                             value=WORLD_TRAIL_STEPS_DEFAULT, step=1,
@@ -519,10 +526,97 @@ def render_world3d():
     ph_chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 def render_edges3d():
+    # 1) Try encoded connections first (long-lived G), if user prefers
+    if 'prefer_encoded_edges' in globals() and prefer_encoded_edges:
+        enc = load_encoded_edges_npz(prefix, run_id, live_token, ttl_val)
+        if enc is not None:
+            # Threshold by tau; cap total edges to avoid overload
+            tau = float(enc.get("tau", 0.05))
+            # Optional: let user override tau per-run
+            c1, c2 = st.columns([1,1])
+            with c1:
+                tau = st.slider("Encode threshold τ (G > τ)", min_value=0.0, max_value=0.5, value=tau, step=0.01)
+            with c2:
+                cap = st.number_input("Max encoded edges to draw", min_value=100, max_value=20000, value=min(MAX_EDGES_PER_FRAME, 3000), step=100)
+
+            fig = go.Figure()
+
+            total_drawn = 0
+            for axis in ("x","y","z"):
+                G = enc["G"+axis]; Eabs = enc["E"+axis]; Es = enc["S"+axis]; P = enc["P"+axis]
+                mask = (G > tau)
+                if not np.any(mask):
+                    continue
+
+                # Flatten masked arrays
+                Gm    = G[mask]
+                Eabsm = Eabs[mask]
+                Esm   = Es[mask]
+                Pm    = P[mask]
+
+                # Rank by G (strongest first), cap
+                order = np.argsort(-Gm)
+                if len(order) > cap:
+                    order = order[:cap]
+                Gm    = Gm[order]
+                Eabsm = Eabsm[order]
+                Esm   = Esm[order]
+                Pm    = Pm[order]
+
+                # Build geometry for chosen edges
+                # We need the same ordering on coordinates: slice index the mask positions the same way
+                # Easiest is rebuild mask coords then apply the same 'order'
+                coords = np.argwhere(mask)
+                coords = coords[order]
+                if axis == "x":
+                    x0 = coords[:,0].astype(float); y0 = coords[:,1].astype(float); z0 = coords[:,2].astype(float)
+                    x1 = x0 + 1.0; y1 = y0;       z1 = z0
+                elif axis == "y":
+                    x0 = coords[:,0].astype(float); y0 = coords[:,1].astype(float); z0 = coords[:,2].astype(float)
+                    x1 = x0;       y1 = y0 + 1.0; z1 = z0
+                else:  # z
+                    x0 = coords[:,0].astype(float); y0 = coords[:,1].astype(float); z0 = coords[:,2].astype(float)
+                    x1 = x0;       y1 = y0;       z1 = z0 + 1.0
+
+                # Colors from embeddings
+                H,Sv,V = _hsv_from_embeddings(Gm, Eabsm, Esm, Pm)
+                R,Gc,B = _hsv_to_rgb_vec(H,Sv,V)
+                # Plotly wants one color per segment; we will split per segment via None separators
+                # For speed, draw as many as possible in a single trace by broadcasting
+                # We approximate by using a single color scale: make one trace per axis with per-point colors
+                # (Color per-vertex works; adjacent vertices share the same color.)
+                x = []; y = []; z = []; col = []
+                for i in range(len(x0)):
+                    x += [x0[i], x1[i], None]
+                    y += [y0[i], y1[i], None]
+                    z += [z0[i], z1[i], None]
+                    # duplicate color values (Plotly uses per-point colors)
+                    c_hex = f"rgb({int(255*R[i])},{int(255*Gc[i])},{int(255*B[i])})"
+                    col += [c_hex, c_hex, c_hex]
+
+                fig.add_trace(go.Scatter3d(
+                    x=x, y=y, z=z, mode="lines",
+                    line=dict(width=3.0),
+                    marker=dict(color=col),
+                    showlegend=False,
+                    name=f"encoded-{axis}"
+                ))
+
+                total_drawn += len(x0)
+
+            if total_drawn > 0:
+                fig.update_layout(height=650, scene=dict(aspectmode="data"),
+                                  margin=dict(l=10,r=10,t=30,b=10),
+                                  title=f"Encoded edges (G > τ), drawn={total_drawn}")
+                ph_chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                return
+            else:
+                st.info("Encoded edges file found, but no edges exceed τ at this step. Lower τ or expand step range.")
+
+    # 2) Fallback to legacy instantaneous edges from parquet (your current behavior)
     files_edges = get_files(prefix, run_id, "edges", prefer_manifest, live_token, ttl_val)
     if not files_edges:
         ph_table.info("No edges_* shards yet."); return
-    # Current step only (edges are heavy)
     drawn = False
     try:
         edf = query_df("""
@@ -542,7 +636,8 @@ def render_edges3d():
             fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode="lines",
                                        line=dict(width=3.0), showlegend=False))
             fig.update_layout(height=650, scene=dict(aspectmode="data"),
-                              margin=dict(l=10,r=10,t=30,b=10))
+                              margin=dict(l=10,r=10,t=30,b=10),
+                              title="Instantaneous edges (fallback)")
             ph_chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             drawn = True
     except Exception:
