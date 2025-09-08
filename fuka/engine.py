@@ -180,6 +180,14 @@ class Engine:
                          catalysts_enabled=int(self.ccfg.enabled))
 
         for step in range(1, self.steps + 1):
+            
+            if (step % cfg.io.get("log_env_every", 1000)) == 0:
+            try:
+                recorder.publish_indices_and_manifest()  # idempotent safe
+            except Exception:
+                pass
+            
+            
             # 0) external pulses (time-varying source)
             try:
                 self.ext.step(step)
