@@ -91,7 +91,7 @@
     "gamma": 0.02,
     "lam": 0.98,
     "tau_encode": 0.05,
-    "save_every": 500
+    "save_every": 200
   },
 
   "io": {
