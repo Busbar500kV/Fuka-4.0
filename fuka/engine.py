@@ -181,13 +181,6 @@ class Engine:
 
         for step in range(1, self.steps + 1):
             
-            if (step % cfg.io.get("log_env_every", 1000)) == 0:
-            try:
-                recorder.publish_indices_and_manifest()  # idempotent safe
-            except Exception:
-                pass
-            
-            
             # 0) external pulses (time-varying source)
             try:
                 self.ext.step(step)
@@ -223,6 +216,10 @@ class Engine:
             try:
                 # encoded connections update uses pre-mix field
                 self.encoder.step(E_pre)
+                # periodic checkpoint so encoded_edges.npz exists mid-run
+                if self.encoder.cfg.enabled and (step % max(1, self.encoder.cfg.save_every)) == 0:
+                    self.encoder.save()
+
             except Exception:
                 pass
             
