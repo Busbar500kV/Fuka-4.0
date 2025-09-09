@@ -97,7 +97,7 @@
   "io": {
     "flush_every": 200,
     "state_topk": 400,
-    "edges_topk": 800,
+    "edges_topk": 0,
     "spectra_bins": 64,
     "event_threshold_sigma": 3.0,
     "log_env_every": 200
