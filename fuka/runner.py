@@ -29,14 +29,12 @@ except Exception:
     # Fallback if module path differs (older repo layouts)
     from engine import run_headless as _engine_run_headless  # type: ignore
 
-# Index/manifest builder (File 2 you just installed)
+# Index/manifest builder
 try:
     from analytics.build_indices import rebuild_indices as _rebuild_indices  # type: ignore
-except Exception as _e:
+except Exception:
     _rebuild_indices = None  # type: ignore
 
-
-# ------------------------------ helpers ------------------------------
 
 def _stamp() -> str:
     return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -70,7 +68,6 @@ def _find_latest_run(data_root: Path) -> Optional[str]:
     cands = [p for p in runs_dir.iterdir() if p.is_dir()]
     if not cands:
         return None
-    # newest by mtime
     latest = max(cands, key=lambda p: p.stat().st_mtime)
     return latest.name
 
@@ -81,21 +78,17 @@ def _call_engine(config_path: Path, data_root: Path, run_id: str) -> None:
       - Newer: run_headless(config_path: str, data_root: str, run_id: str)
       - Older: run_headless(config_path: str, data_root: str)
     """
-    # Some engines honor RUN_ID via env; set it as a courtesy
-    os.environ["FUKA_RUN_ID"] = run_id
+    os.environ["FUKA_RUN_ID"] = run_id  # courtesy for engines that read env
 
     try:
         _echo("INFO", f"Calling engine.run_headless(config='{config_path}', data_root='{data_root}', run_id='{run_id}')")
         _engine_run_headless(str(config_path), str(data_root), str(run_id))  # type: ignore[arg-type]
         return
     except TypeError:
-        # Fall back to legacy 2-arg signature
         _echo("WARN", "Engine run_headless() does not accept run_id; falling back to (config_path, data_root).")
         _engine_run_headless(str(config_path), str(data_root))  # type: ignore[arg-type]
         return
 
-
-# ------------------------------ main flow ------------------------------
 
 def run(
     config_path: Path,
@@ -118,7 +111,7 @@ def run(
     if prefix:
         _echo("INFO", f"public_prefix={prefix}")
 
-    # Write a minimal meta upfront (helpful for debugging if a run crashes early)
+    # Minimal meta upfront (useful if crash happens early)
     _write_meta(
         run_dir,
         {
@@ -139,8 +132,7 @@ def run(
         _echo("FATAL", f"Engine failed: {type(e).__name__}: {e}")
         raise
 
-    # Engines that ignore run_id may write into a different/new folder;
-    # try to detect that and correct our run_id so downstream steps work.
+    # If engine ignored run_id, try to recover latest written run
     if not (data_root / "runs" / resolved_run_id / "shards").glob("*.parquet"):
         latest = _find_latest_run(data_root)
         if latest and latest != resolved_run_id:
@@ -148,7 +140,7 @@ def run(
             resolved_run_id = latest
             run_dir = data_root / "runs" / resolved_run_id
 
-    # Index/manifest
+    # Rebuild indices/manifest
     if not skip_index:
         if _rebuild_indices is None:
             _echo("ERROR", "analytics.build_indices not available; skipping index/manifest rebuild.")
@@ -158,9 +150,8 @@ def run(
                 _echo("OK", f"indices + manifest rebuilt for run_id={resolved_run_id}")
             except Exception as e:
                 _echo("ERROR", f"Index/manifest rebuild failed: {type(e).__name__}: {e}")
-                # Do not raise — rendering may still proceed via direct shard paths.
 
-    # Final meta (append/overwrite)
+    # Final meta
     _write_meta(
         run_dir,
         {
@@ -175,8 +166,6 @@ def run(
     _echo("DONE", f"run_id={resolved_run_id}")
     return resolved_run_id
 
-
-# ------------------------------ CLI ------------------------------
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Fuka headless runner")
