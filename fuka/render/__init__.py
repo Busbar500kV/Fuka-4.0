@@ -1,6 +1,11 @@
 # fuka/render/__init__.py
+"""
+Fuka rendering helpers.
 
-# Export a friendly alias so older imports keep working.
-from .pack_npz import pack_to_npz as pack_npz, pack_to_npz
+Exports:
+- pack_npz : pack shards into canonical NPZ for Manim
+"""
 
-__all__ = ["pack_npz", "pack_to_npz"]
+from .pack_npz import pack
+
+__all__ = ["pack"]
