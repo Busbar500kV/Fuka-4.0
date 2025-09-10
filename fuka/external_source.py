@@ -1,99 +1,215 @@
+# fuka/external_source.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Literal, Optional, Tuple, List, Dict, Any
 import numpy as np
 
-from .physics import World3D
+from .physics import World3D, _stable_seed_from
 
-@dataclass
-class Sinusoid:
-    center: Tuple[float, float, float]
-    amp: float
-    sigma: float
-    # either freq_hz with dt_seconds, or freq_cps (cycles per step)
-    freq_hz: Optional[float] = None
-    freq_cps: Optional[float] = None
-    phase_deg: float = 0.0
-    t_on: int = 0
-    t_off: int = 2**31 - 1  # large default
+
+SourceKind = Literal[
+    "off",          # no-op
+    "pulse",        # periodic delta injection at fixed coords
+    "sin",          # sinusoidal drive at fixed coords
+    "random",       # white-noise injection across the field
+    "mask_pulse",   # pulse over a static binary mask
+    "moving_pulse", # pulse whose center moves linearly
+]
+
 
 @dataclass
 class ExternalSourceCfg:
-    enabled: bool = True
-    # Pulses: (t0, t1, x, y, z, amp, sigma)
-    pulses: Optional[List[Tuple[int,int,float,float,float,float,float]]] = None
-    # Functional sinusoids (sum of components)
-    sinusoids: Optional[List[Dict[str, Any]]] = None
-    clip: float = 2.0
-    dt_seconds: float = 0.001  # default 1 ms per step if freq_hz is used
+    """
+    Deterministic stimulus injector for the energy field.
+
+    Common
+    ------
+    kind            : SourceKind
+    seed            : Optional[int]      # RNG seed; if None, derived from cfg
+    amplitude       : float              # base amplitude of injection
+    start_step      : int                # first step (inclusive)
+    stop_step       : Optional[int]      # last step (inclusive); None = forever
+    every           : int                # apply every N steps (>=1)
+
+    Pulse/Sin
+    ---------
+    coord           : Tuple[int,int,int] # voxel coordinate (x,y,z)
+    omega_hz        : float              # for kind="sin" (cycles/sec equivalent)
+    dt_seconds      : float              # timestep seconds (engine passes via cfg)
+
+    Random
+    ------
+    random_frac     : float              # fraction of voxels to excite per call (0..1)
+
+    Mask pulse
+    ---------
+    mask_seed       : Optional[int]      # to generate deterministic mask
+    mask_frac       : float              # fraction of voxels set to 1 (0..1)
+
+    Moving pulse
+    ------------
+    start_coord     : Tuple[int,int,int]
+    end_coord       : Tuple[int,int,int]
+    """
+    kind: SourceKind = "off"
+    seed: Optional[int] = None
+    amplitude: float = 0.0
+    start_step: int = 0
+    stop_step: Optional[int] = None
+    every: int = 1
+
+    # pulse / sin
+    coord: Tuple[int, int, int] = (0, 0, 0)
+    omega_hz: float = 1.0
+    dt_seconds: float = 0.001
+
+    # random
+    random_frac: float = 0.0
+
+    # mask pulse
+    mask_seed: Optional[int] = None
+    mask_frac: float = 0.0
+
+    # moving pulse
+    start_coord: Tuple[int, int, int] = (0, 0, 0)
+    end_coord: Tuple[int, int, int] = (0, 0, 0)
+
 
 class ExternalSource:
-    def __init__(self, world: World3D, cfg: ExternalSourceCfg):
+    """
+    Stateless interface from the Engine's POV; internally holds RNG and (optional) mask.
+    All effects are **additive** to world.energy (float32).
+    """
+    def __init__(self, world: World3D, cfg: ExternalSourceCfg) -> None:
         self.world = world
         self.cfg = cfg
-        self._pulses = cfg.pulses or []
-        self._sins: List[Sinusoid] = []
-        if cfg.sinusoids:
-            for s in cfg.sinusoids:
-                self._sins.append(
-                    Sinusoid(
-                        center=tuple(map(float, s.get("center", (world.nx/2, world.ny/2, world.nz/2)))),
-                        amp=float(s.get("amp", 0.0)),
-                        sigma=float(s.get("sigma", 3.0)),
-                        freq_hz=s.get("freq_hz", None),
-                        freq_cps=s.get("freq_cps", None),
-                        phase_deg=float(s.get("phase_deg", 0.0)),
-                        t_on=int(s.get("t_on", 0)),
-                        t_off=int(s.get("t_off", 2**31-1)),
-                    )
-                )
 
-    def _deposit_gaussian(self, center, amp, sigma):
-        x0, y0, z0 = center
-        nx, ny, nz = self.world.nx, self.world.ny, self.world.nz
-        r = max(1.0, sigma) * 3.0
-        xmin = int(max(0, np.floor(x0 - r))); xmax = int(min(nx-1, np.ceil(x0 + r)))
-        ymin = int(max(0, np.floor(y0 - r))); ymax = int(min(ny-1, np.ceil(y0 + r)))
-        zmin = int(max(0, np.floor(z0 - r))); zmax = int(min(nz-1, np.ceil(z0 + r)))
-        if xmin>xmax or ymin>ymax or zmin>zmax: return 0.0
-        xs = np.arange(xmin, xmax+1, dtype=np.float32)
-        ys = np.arange(ymin, ymax+1, dtype=np.float32)
-        zs = np.arange(zmin, zmax+1, dtype=np.float32)
-        X,Y,Z = np.meshgrid(xs, ys, zs, indexing="ij")
-        inv2s2 = 1.0 / (2.0 * (sigma**2 + 1e-12))
-        G = np.exp(-((X-x0)**2 + (Y-y0)**2 + (Z-z0)**2) * inv2s2).astype(np.float32)
-        blob = (amp * G).astype(np.float32)
-        if self.cfg.clip is not None:
-            np.clip(blob, -float(self.cfg.clip), float(self.cfg.clip), out=blob)
-        self.world.energy[xmin:xmax+1, ymin:ymax+1, zmin:zmax+1] += blob
-        return float(np.sum(blob))
+        # Deterministic RNG
+        seed = cfg.seed
+        if seed is None:
+            seed = _stable_seed_from((
+                "ext", cfg.kind, cfg.amplitude, cfg.start_step, cfg.stop_step, cfg.every,
+                cfg.coord, cfg.omega_hz, cfg.dt_seconds, cfg.random_frac,
+                cfg.mask_seed, cfg.mask_frac, cfg.start_coord, cfg.end_coord,
+                world.nx, world.ny, world.nz
+            ))
+        self.rng = np.random.default_rng(int(seed))
 
-    def _sin_amp_at(self, s: Sinusoid, t_step: int) -> float:
-        if not (s.t_on <= t_step <= s.t_off):
-            return 0.0
-        phase_rad = np.deg2rad(s.phase_deg)
-        if s.freq_cps is not None:
-            # cycles per step (native discrete frequency)
-            omega = 2.0 * np.pi * float(s.freq_cps) * t_step
-        elif s.freq_hz is not None:
-            # physical Hz using dt_seconds
-            omega = 2.0 * np.pi * float(s.freq_hz) * (t_step * float(self.cfg.dt_seconds))
+        # Precompute mask if needed
+        self._mask: Optional[np.ndarray] = None
+        if cfg.kind == "mask_pulse":
+            self._mask = self._make_mask(cfg)
+
+    # ------------------ public API ------------------
+
+    def step(self, step: int) -> None:
+        c = self.cfg
+        if c.kind == "off":
+            return
+        if step < c.start_step:
+            return
+        if c.stop_step is not None and step > c.stop_step:
+            return
+        if c.every <= 0 or (step % max(1, c.every)) != 0:
+            return
+        amp = float(c.amplitude)
+        if amp == 0.0:
+            return
+
+        if c.kind == "pulse":
+            self._inject_pulse(c.coord, amp)
+        elif c.kind == "sin":
+            self._inject_sin(c.coord, amp, step)
+        elif c.kind == "random":
+            self._inject_random(amp, frac=c.random_frac)
+        elif c.kind == "mask_pulse":
+            self._inject_mask_pulse(amp)
+        elif c.kind == "moving_pulse":
+            self._inject_moving_pulse(amp, step)
         else:
-            return 0.0
-        return float(s.amp * np.sin(omega + phase_rad))
+            # unknown kind -> no-op (forward compatible)
+            return
 
-    def step(self, t: int) -> float:
-        """Deposit pulses + sinusoidal components at time step t; returns total added energy."""
-        if not self.cfg.enabled:
-            return 0.0
-        total = 0.0
-        # Pulses
-        for (t0,t1,x,y,z,amp,sigma) in self._pulses:
-            if t0 <= t <= t1:
-                total += self._deposit_gaussian((x,y,z), float(amp), float(sigma))
-        # Sinusoidal components
-        for s in self._sins:
-            a = self._sin_amp_at(s, t)
-            if a != 0.0:
-                total += self._deposit_gaussian(s.center, a, s.sigma)
-        return total
+    # ------------------ implementations ------------------
+
+    def _inject_pulse(self, coord: Tuple[int,int,int], amp: float) -> None:
+        x, y, z = self._clamp_coord(coord)
+        self.world.energy[x, y, z] += amp
+
+    def _inject_sin(self, coord: Tuple[int,int,int], amp: float, step: int) -> None:
+        # sin(2π f t), t = step * dt
+        t = float(step) * float(self.cfg.dt_seconds)
+        val = float(np.sin(2.0 * np.pi * float(self.cfg.omega_hz) * t))
+        x, y, z = self._clamp_coord(coord)
+        self.world.energy[x, y, z] += amp * val
+
+    def _inject_random(self, amp: float, frac: float) -> None:
+        frac = float(np.clip(frac, 0.0, 1.0))
+        if frac <= 0.0:
+            return
+        nx, ny, nz = self.world.nx, self.world.ny, self.world.nz
+        N = nx * ny * nz
+        k = int(np.round(frac * N))
+        if k <= 0:
+            return
+        # sample k distinct flat indices (deterministic RNG)
+        idx = self.rng.choice(N, size=k, replace=False)
+        x = (idx // (ny * nz)).astype(np.int64)
+        rem = idx % (ny * nz)
+        y = (rem // nz).astype(np.int64)
+        z = (rem % nz).astype(np.int64)
+        self.world.energy[x, y, z] += amp
+
+    def _inject_mask_pulse(self, amp: float) -> None:
+        if self._mask is None:
+            return
+        self.world.energy[self._mask] += amp
+
+    def _inject_moving_pulse(self, amp: float, step: int) -> None:
+        # Linear interpolation in index space from start_coord -> end_coord over active window
+        c = self.cfg
+        t0 = int(c.start_step)
+        t1 = int(c.stop_step) if c.stop_step is not None else t0
+        if t1 <= t0:
+            # degenerate or single step window
+            coord = c.end_coord if step >= t1 else c.start_coord
+            x, y, z = self._clamp_coord(coord)
+            self.world.energy[x, y, z] += amp
+            return
+        # normalized phase
+        u = np.clip((step - t0) / float(t1 - t0), 0.0, 1.0)
+        p0 = np.array(c.start_coord, dtype=float)
+        p1 = np.array(c.end_coord, dtype=float)
+        p = (1.0 - u) * p0 + u * p1
+        coord = tuple(int(round(v)) for v in p.tolist())
+        x, y, z = self._clamp_coord(coord)
+        self.world.energy[x, y, z] += amp
+
+    # ------------------ helpers ------------------
+
+    def _clamp_coord(self, coord: Tuple[int,int,int]) -> Tuple[int,int,int]:
+        x, y, z = coord
+        x = int(np.clip(x, 0, self.world.nx - 1))
+        y = int(np.clip(y, 0, self.world.ny - 1))
+        z = int(np.clip(z, 0, self.world.nz - 1))
+        return x, y, z
+
+    def _make_mask(self, cfg: ExternalSourceCfg) -> np.ndarray:
+        nx, ny, nz = self.world.nx, self.world.ny, self.world.nz
+        frac = float(np.clip(cfg.mask_frac, 0.0, 1.0))
+        N = nx * ny * nz
+        k = int(np.round(frac * N))
+        mask = np.zeros((nx, ny, nz), dtype=bool)
+        if k <= 0:
+            return mask
+        seed = cfg.mask_seed
+        if seed is None:
+            seed = _stable_seed_from(("ext_mask", cfg.mask_frac, nx, ny, nz))
+        rng = np.random.default_rng(int(seed))
+        idx = rng.choice(N, size=k, replace=False)
+        x = (idx // (ny * nz)).astype(np.int64)
+        rem = idx % (ny * nz)
+        y = (rem // nz).astype(np.int64)
+        z = (rem % nz).astype(np.int64)
+        mask[x, y, z] = True
+        return mask
