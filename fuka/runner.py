@@ -1,227 +1,211 @@
 # fuka/runner.py
-
 from __future__ import annotations
-import os, json, subprocess, sys
+
+"""
+Headless runner for Fuka.
+
+Responsibilities
+- Load a config, choose/normalize a run_id, and ensure a clean run directory.
+- Invoke the engine's headless execution (compatible with both old and new signatures).
+- Always rebuild per-table indexes and the run-level manifest on completion.
+- Emit clear, machine-parseable logs and non-zero exit codes on hard failures.
+
+This file does not render or upload. Rendering/publishing is handled by external scripts.
+"""
+
+import argparse
+import datetime as _dt
+import json
+import os
+import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Optional
 
-from .engine import Engine
-from .recorder import ParquetRecorder  # import the class directly
+# Engine entrypoint (we support both signatures shown in historical code)
+try:
+    # Typical location in this repo
+    from core.engine import run_headless as _engine_run_headless  # type: ignore
+except Exception:
+    # Fallback if module path differs (older repo layouts)
+    from engine import run_headless as _engine_run_headless  # type: ignore
+
+# Index/manifest builder (File 2 you just installed)
+try:
+    from analytics.build_indices import rebuild_indices as _rebuild_indices  # type: ignore
+except Exception as _e:
+    _rebuild_indices = None  # type: ignore
 
 
-def _load_cfg(path: str) -> dict:
-    with open(path, "r") as f:
-        return json.load(f)
+# ------------------------------ helpers ------------------------------
+
+def _stamp() -> str:
+    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _debug(msg: str) -> None:
-    print(f"[RUNNER] {msg}", flush=True)
+def _ts_run_id(prefix: str = "FUKA_4_0_3D") -> str:
+    return f"{prefix}_{_dt.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
 
 
-def _run_subprocess(cmd: List[str], name: str) -> bool:
+def _echo(level: str, msg: str) -> None:
+    print(f"[{_stamp()}] [{level}] {msg}", flush=True)
+
+
+def _ensure_run_dir(data_root: Path, run_id: str) -> Path:
+    run_dir = data_root / "runs" / run_id
+    (run_dir / "shards").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _write_meta(run_dir: Path, meta: dict) -> None:
+    meta_path = run_dir / "run_meta.json"
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def _find_latest_run(data_root: Path) -> Optional[str]:
+    runs_dir = data_root / "runs"
+    if not runs_dir.is_dir():
+        return None
+    cands = [p for p in runs_dir.iterdir() if p.is_dir()]
+    if not cands:
+        return None
+    # newest by mtime
+    latest = max(cands, key=lambda p: p.stat().st_mtime)
+    return latest.name
+
+
+def _call_engine(config_path: Path, data_root: Path, run_id: str) -> None:
+    """
+    Call engine.run_headless with best-effort signature compatibility:
+      - Newer: run_headless(config_path: str, data_root: str, run_id: str)
+      - Older: run_headless(config_path: str, data_root: str)
+    """
+    # Some engines honor RUN_ID via env; set it as a courtesy
+    os.environ["FUKA_RUN_ID"] = run_id
+
     try:
-        _debug(f"exec: {' '.join(cmd)}")
-        res = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        if res.returncode != 0:
-            _debug(f"{name} FAILED (code {res.returncode})\nSTDERR:\n{res.stderr.strip()}")
-            return False
-        _debug(f"{name} OK")
-        return True
-    except Exception as e:
-        _debug(f"{name} EXCEPTION: {e}")
-        return False
+        _echo("INFO", f"Calling engine.run_headless(config='{config_path}', data_root='{data_root}', run_id='{run_id}')")
+        _engine_run_headless(str(config_path), str(data_root), str(run_id))  # type: ignore[arg-type]
+        return
+    except TypeError:
+        # Fall back to legacy 2-arg signature
+        _echo("WARN", "Engine run_headless() does not accept run_id; falling back to (config_path, data_root).")
+        _engine_run_headless(str(config_path), str(data_root))  # type: ignore[arg-type]
+        return
 
 
-def _relative_https(bucket_https_base: str, p: Path) -> str:
-    # p is an absolute or relative local path like "<data_root>/runs/<RUN>/shards/state_000.parquet"
-    # We want HTTPS pointing to "runs/<RUN>/shards/state_000.parquet"
-    # Streamlit app prepends DATA_URL_PREFIX; but our *_index.json on GCS should hold absolute HTTPS.
-    # We'll build absolute HTTPS here: base + relative under bucket root.
-    # Expect layout: <data_root>/runs/<RUN>/...
-    # Find the "runs" component and take relative from there.
-    parts = list(p.as_posix().split("/"))
-    try:
-        k = parts.index("runs")
-        rel = "/".join(parts[k:])  # e.g., "runs/<RUN>/shards/file.parquet"
-    except ValueError:
-        rel = p.as_posix()
-    return f"{bucket_https_base}/{rel}"
+# ------------------------------ main flow ------------------------------
 
-
-def _build_local_table_indices(run_dir: Path) -> Dict[str, List[str]]:
+def run(
+    config_path: Path,
+    data_root: Path = Path("data"),
+    run_id: Optional[str] = None,
+    prefix: Optional[str] = None,
+    skip_index: bool = False,
+) -> str:
     """
-    Build per-table indices under: <run_dir>/shards/<table>_index.json
-    Returns a dict table -> [relative paths under 'data/...' or absolute].
+    Execute a headless simulation and (optionally) rebuild indices/manifest.
+
+    Returns the resolved run_id.
     """
-    shards_dir = run_dir / "shards"
-    shards_dir.mkdir(parents=True, exist_ok=True)
+    resolved_run_id = run_id or _ts_run_id()
+    run_dir = _ensure_run_dir(data_root, resolved_run_id)
 
-    by_table: Dict[str, List[str]] = {}
-    for f in sorted(shards_dir.glob("*.parquet")):
-        name = f.name
-        if "_" not in name:
-            continue
-        table = name.split("_", 1)[0]
-        by_table.setdefault(table, []).append(f)
+    _echo("RUN", f"run_id={resolved_run_id}")
+    _echo("INFO", f"data_root={data_root}")
+    _echo("INFO", f"config={config_path}")
+    if prefix:
+        _echo("INFO", f"public_prefix={prefix}")
 
-    # Write local indices (relative 'data/...' paths so local UI can also read via manifest_to_https)
-    out: Dict[str, List[str]] = {}
-    for table, files in by_table.items():
-        # local JSON uses relative paths (the Streamlit manifest_to_https will convert to HTTPS if needed)
-        rels = [f"data/runs/{run_dir.name}/shards/{f.name}" for f in files]
-        idx_path = shards_dir / f"{table}_index.json"
-        idx_path.write_text(json.dumps({"files": rels}, indent=2))
-        out[table] = rels
-    return out
-
-
-def _ensure_manifest_from_shards(run_dir: Path) -> None:
-    """
-    Ensure manifest.json exists and contains all shard parquet entries.
-    """
-    manifest_path = run_dir / "manifest.json"
-    shards_dir = run_dir / "shards"
-    shards = []
-    for f in sorted(shards_dir.glob("*.parquet")):
-        name = f.name
-        if "_" not in name:
-            continue
-        table = name.split("_", 1)[0]
-        # manifest expects "path" relative under "data/..."
-        path_rel = f"data/runs/{run_dir.name}/shards/{name}"
-        shards.append({"table": table, "path": path_rel})
-    payload = {
-        "run_id": run_dir.name,
-        "shards": shards,
-    }
-    tmp = manifest_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(manifest_path)
-
-
-def _build_local_runs_index(runs_root: Path) -> Path:
-    """
-    Build runs/index.json listing all subdirectories under runs_root.
-    """
-    runs_index = runs_root / "index.json"
-    runs = []
-    for p in sorted(runs_root.glob("*/")):
-        if (p / "shards").exists():
-            runs.append(p.name)
-    tmp = runs_index.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"runs": runs}, indent=2))
-    tmp.replace(runs_index)
-    return runs_index
-
-
-def _maybe_publish_to_gcs(bucket: str, runs_root: Path, run_id: str) -> None:
-    """
-    Upload manifest + per-table indices + runs/index.json to GCS.
-    Optional public read if FUKA_PUBLISH_PUBLIC=1.
-    """
-    make_public = os.environ.get("FUKA_PUBLISH_PUBLIC", "") == "1"
-    bucket_uri = f"gs://{bucket}"
-    bucket_https = f"https://storage.googleapis.com/{bucket}"
-
-    run_dir = runs_root / run_id
-    shards_dir = run_dir / "shards"
-
-    # Upload manifest
-    _run_subprocess(["gsutil", "cp", str(run_dir / "manifest.json"),
-                     f"{bucket_uri}/runs/{run_id}/manifest.json"], "GCS manifest upload")
-
-    # Upload per-table indices
-    for idx in shards_dir.glob("*_index.json"):
-        _run_subprocess(["gsutil", "cp", str(idx),
-                         f"{bucket_uri}/runs/{run_id}/shards/{idx.name}"], f"GCS {idx.name} upload")
-
-    # Upload runs/index.json
-    _run_subprocess(["gsutil", "cp", str(runs_root / "index.json"),
-                     f"{bucket_uri}/runs/index.json"], "GCS runs/index.json upload")
-
-    if make_public:
-        _run_subprocess(["gsutil", "acl", "ch", "-u", "AllUsers:R",
-                         f"{bucket_uri}/runs/{run_id}/manifest.json"], "GCS ACL manifest public")
-        for idx in shards_dir.glob("*_index.json"):
-            _run_subprocess(["gsutil", "acl", "ch", "-u", "AllUsers:R",
-                             f"{bucket_uri}/runs/{run_id}/shards/{idx.name}"], f"GCS ACL {idx.name} public")
-        _run_subprocess(["gsutil", "acl", "ch", "-u", "AllUsers:R",
-                         f"{bucket_uri}/runs/index.json"], "GCS ACL runs/index.json public")
-
-
-def _publish_with_script_or_fallback(data_root: Path, run_id: str) -> None:
-    """
-    Try analytics/build_indices.py first (legacy path).
-    If missing/fails, build indices/manifest/runs-index locally in Python.
-    Then optionally publish to GCS if FUKA_GCS_BUCKET is set.
-    """
-    runs_root = data_root / "runs"
-    repo_root = Path(__file__).resolve().parents[1]
-    build_py = repo_root / "analytics" / "build_indices.py"
-
-    used_script = False
-    if build_py.exists():
-        # Local indices build
-        ok_local = _run_subprocess(
-            ["python", str(build_py), "--data_root", str(data_root), "--run_id", run_id],
-            "build_indices.py (local)"
-        )
-        used_script = True
-        if not ok_local:
-            _debug("build_indices.py local failed; falling back to internal Python builder.")
-    else:
-        _debug("analytics/build_indices.py not found; using internal Python builder.")
-
-    # Fallback: build indices/manifest locally in Python if needed
-    try:
-        # Always ensure *_index.json exist (idempotent)
-        _build_local_table_indices(runs_root / run_id)
-        # Always ensure manifest exists and reflects shards
-        _ensure_manifest_from_shards(runs_root / run_id)
-        # Always rebuild runs/index.json from local runs dir
-        _build_local_runs_index(runs_root)
-        _debug("Local indices/manifest/runs-index built OK.")
-    except Exception as e:
-        _debug(f"Local index build EXCEPTION: {e}")
-
-    # Publish to GCS if configured
-    bucket = os.environ.get("FUKA_GCS_BUCKET", "").strip()
-    if bucket:
-        if build_py.exists():
-            ok_gcs = _run_subprocess(
-                ["python", str(build_py), "--bucket", bucket, "--run_id", run_id, "--to_gcs",
-                 "--publish_runs_index", "--publish_manifest"],
-                "build_indices.py (GCS publish)"
-            )
-            if not ok_gcs:
-                _debug("build_indices.py GCS publish failed; falling back to direct gsutil publish.")
-                _maybe_publish_to_gcs(bucket, runs_root, run_id)
-        else:
-            _maybe_publish_to_gcs(bucket, runs_root, run_id)
-    else:
-        _debug("FUKA_GCS_BUCKET not set; skipping GCS publish.")
-
-
-def run_headless(config_path: str, data_root: str) -> None:
-    cfg = _load_cfg(config_path)
-
-    run_id = str(cfg.get("run_name") or cfg.get("run_id") or "FUKA_4_0_RUN")
-    steps  = int(cfg.get("steps", 0))
-    flush_every = int(cfg.get("io", {}).get("flush_every", 1000))
-
-    # Recorder writes under <data_root>/runs/<run_id>/
-    runs_root = Path(data_root) / "runs"
-    rec = ParquetRecorder(
-        data_root=str(runs_root),
-        run_id=run_id,
-        flush_every=flush_every,
+    # Write a minimal meta upfront (helpful for debugging if a run crashes early)
+    _write_meta(
+        run_dir,
+        {
+            "run_id": resolved_run_id,
+            "created_utc": _stamp(),
+            "data_root": str(data_root),
+            "config_path": str(config_path),
+            "public_prefix": prefix,
+            "host": os.uname().nodename if hasattr(os, "uname") else "unknown",
+            "pid": os.getpid(),
+        },
     )
 
-    # Run engine (pass full cfg so physics/world/io/catalysts are available)
-    eng = Engine(recorder=rec, steps=steps, cfg=cfg)
-    eng.run()
+    # Execute engine
+    try:
+        _call_engine(config_path, data_root, resolved_run_id)
+    except Exception as e:
+        _echo("FATAL", f"Engine failed: {type(e).__name__}: {e}")
+        raise
 
-    # Post: build indices/manifest locally (or via legacy script), and publish if configured
-    _publish_with_script_or_fallback(Path(data_root), run_id)
+    # Engines that ignore run_id may write into a different/new folder;
+    # try to detect that and correct our run_id so downstream steps work.
+    if not (data_root / "runs" / resolved_run_id / "shards").glob("*.parquet"):
+        latest = _find_latest_run(data_root)
+        if latest and latest != resolved_run_id:
+            _echo("WARN", f"No shards found under run_id '{resolved_run_id}'. Using latest found run '{latest}'.")
+            resolved_run_id = latest
+            run_dir = data_root / "runs" / resolved_run_id
 
-    _debug(f"Headless run complete: {run_id}")
+    # Index/manifest
+    if not skip_index:
+        if _rebuild_indices is None:
+            _echo("ERROR", "analytics.build_indices not available; skipping index/manifest rebuild.")
+        else:
+            try:
+                _rebuild_indices(str(data_root), resolved_run_id, prefix)
+                _echo("OK", f"indices + manifest rebuilt for run_id={resolved_run_id}")
+            except Exception as e:
+                _echo("ERROR", f"Index/manifest rebuild failed: {type(e).__name__}: {e}")
+                # Do not raise — rendering may still proceed via direct shard paths.
+
+    # Final meta (append/overwrite)
+    _write_meta(
+        run_dir,
+        {
+            "run_id": resolved_run_id,
+            "completed_utc": _stamp(),
+            "data_root": str(data_root),
+            "config_path": str(config_path),
+            "public_prefix": prefix,
+        },
+    )
+
+    _echo("DONE", f"run_id={resolved_run_id}")
+    return resolved_run_id
+
+
+# ------------------------------ CLI ------------------------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Fuka headless runner")
+    ap.add_argument("--config", required=True, help="Path to simulation config (JSON/YAML)")
+    ap.add_argument("--data_root", default="data", help="Data root (default: data)")
+    ap.add_argument("--run_id", default=None, help="Override run id (default: timestamped)")
+    ap.add_argument(
+        "--prefix",
+        default=os.environ.get("DATA_URL_PREFIX", "").strip() or None,
+        help="Public HTTPS prefix for indices (e.g., https://storage.googleapis.com/fuka4-runs)",
+    )
+    ap.add_argument("--skip_index", action="store_true", help="Skip index/manifest rebuild")
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    try:
+        run(
+            config_path=Path(args.config),
+            data_root=Path(args.data_root),
+            run_id=args.run_id,
+            prefix=args.prefix,
+            skip_index=bool(args.skip_index),
+        )
+    except Exception:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
