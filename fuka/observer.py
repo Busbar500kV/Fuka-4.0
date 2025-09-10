@@ -1,41 +1,72 @@
+# fuka/observer.py
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Optional, Dict, Any
+import numpy as np
 from pathlib import Path
-import numpy as np, json
-from .physics import World3D, get_alpha
+
 
 @dataclass
 class ObserverCfg:
-    enabled: bool = True
-    lambda_edge: float = 0.98  # EMA factor
+    """
+    Optional observer for diagnostics.
+
+    Parameters
+    ----------
+    log_every : int
+        Interval of steps at which to compute stats (0 = off).
+    out_dir : Optional[str]
+        Directory to drop CSV/NPZ diagnostics. If None, in-memory only.
+    """
+    log_every: int = 0
+    out_dir: Optional[str] = None
+
 
 class Observer:
-    def __init__(self, world: World3D, cfg: ObserverCfg, out_dir: Path):
+    """
+    Lightweight, headless-safe observer.
+    - At chosen intervals, computes global stats of world.energy.
+    - Optionally appends them to a CSV in out_dir.
+    - Keeps last_stats for programmatic access.
+    """
+    def __init__(self, world, cfg: ObserverCfg, run_dir: Path) -> None:
         self.world = world
         self.cfg = cfg
-        self.out_dir = Path(out_dir) / "observer"
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        nx,ny,nz = world.nx, world.ny, world.nz
-        self.Wx = np.zeros((nx-1,ny,nz), dtype=np.float32)
-        self.Wy = np.zeros((nx,ny-1,nz), dtype=np.float32)
-        self.Wz = np.zeros((nx,ny,nz-1), dtype=np.float32)
+        self.run_dir = Path(cfg.out_dir or run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        self.last_stats: Dict[str, Any] = {}
+        self._rows: list[Dict[str, Any]] = []
+        self._csv_path = self.run_dir / "observer_stats.csv" if cfg.log_every > 0 else None
 
     def step(self) -> None:
-        if not self.cfg.enabled: return
-        E = self.world.energy
-        lam = float(self.cfg.lambda_edge)
-        # finite-diff flux magnitude proxy ~ alpha * |grad|
-        fx = np.abs(E[1:,:,:] - E[:-1,:,:])
-        fy = np.abs(E[:,1:,:] - E[:,:-1,:])
-        fz = np.abs(E[:,:,1:] - E[:,:,:-1])
-        self.Wx = lam*self.Wx + (1.0-lam)*fx
-        self.Wy = lam*self.Wy + (1.0-lam)*fy
-        self.Wz = lam*self.Wz + (1.0-lam)*fz
+        if self.cfg.log_every <= 0:
+            return
+        step = getattr(self.world, "step_counter", None)
+        if step is None:
+            # allow engine to pass step explicitly if needed
+            return
+        if (step % self.cfg.log_every) != 0:
+            return
 
-    def finalize(self, extra_metrics: dict | None = None) -> None:
-        if not self.cfg.enabled: return
-        np.savez_compressed(self.out_dir / "effective_edges.npz",
-                            Wx=self.Wx, Wy=self.Wy, Wz=self.Wz)
-        metrics = {"sum_energy": float(np.sum(self.world.energy))}
-        if extra_metrics: metrics.update(extra_metrics)
-        (self.out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        E = self.world.energy
+        stats = {
+            "step": int(step),
+            "mean": float(np.mean(E)),
+            "std": float(np.std(E)),
+            "min": float(np.min(E)),
+            "max": float(np.max(E)),
+        }
+        self.last_stats = stats
+        self._rows.append(stats)
+
+    def finalize(self, extra: Dict[str, Any] | None = None) -> None:
+        if self._csv_path is None or not self._rows:
+            return
+        import pandas as pd
+        df = pd.DataFrame(self._rows)
+        if extra:
+            for k, v in extra.items():
+                df[k] = v
+        df.to_csv(self._csv_path, index=False)
+        self._rows.clear()
