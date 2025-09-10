@@ -1,289 +1,293 @@
+# fuka/physics.py
 from __future__ import annotations
-import numpy as np
 from dataclasses import dataclass
-from typing import Iterable, Tuple, Dict, Any, List
+from typing import Dict, Iterable, Iterator, List, Tuple, Any
+
+import numpy as np
 
 
-# ----------------------------
-# Core physics configuration
-# ----------------------------
+# ============================================================
+# Configuration dataclasses
+# ============================================================
+
 @dataclass
 class PhysicsCfg:
-    T: float = 0.0015           # white-noise std dev per step
-    flux_limit: float = 0.20    # 6-neighbour diffusion blend in [0,1]
-    boundary_leak: float = 0.01 # fractional loss at boundary faces
-    radius: int = 1             # reserved (peak-locality), not used by the solver here
-    seed: int | None = None     # RNG seed for reproducibility
+    """
+    Base field dynamics.
+      - T:          additive Gaussian noise std (thermodynamic "temperature")
+      - flux_limit: per-step clamp on absolute Laplacian flux (stability guard)
+      - boundary_leak: fraction leaked at domain boundary per step (0..1)
+      - update_mode: "euler" (explicit) or "random" (random-site micro-steps, kept for compatibility)
+      - alpha: diffusion strength (0..1], if None derived from grid via get_alpha()
+    """
+    T: float = 0.0015
+    flux_limit: float = 0.20
+    boundary_leak: float = 0.01
+    update_mode: str = "euler"
+    alpha: float | None = None
 
+
+@dataclass
+class CatalystsCfg:
+    """
+    Minimal, headless-friendly catalyst system.
+      - spawn_rate: expected births per step (Poisson)
+      - decay_p:    probability of removal per step
+      - deposit:    energy deposit per visit (added to world.energy at position)
+      - walk_sigma: std of Gaussian step in voxel units (clamped to 1-neighbour hops)
+      - max_count:  hard cap on simultaneous catalysts
+      - seed:       RNG seed for reproducibility
+    """
+    spawn_rate: float = 0.0
+    decay_p: float = 0.01
+    deposit: float = 0.0
+    walk_sigma: float = 0.7
+    max_count: int = 10_000
+    seed: int | None = None
+
+
+# ============================================================
+# World
+# ============================================================
 
 class World3D:
     """
-    A simple 3D scalar field 'energy' on an axis-aligned grid.
+    Holds the primary scalar field (energy) and RNG.
+    All arrays are float32 for memory + speed; indices are int64.
     """
-    def __init__(self, grid_shape: Tuple[int, int, int], cfg: PhysicsCfg) -> None:
-        self.grid_shape = tuple(int(x) for x in grid_shape)
-        assert len(self.grid_shape) == 3 and all(s > 0 for s in self.grid_shape), "grid_shape must be (nx,ny,nz)>0"
-        self.cfg = cfg
-        self.rng = np.random.default_rng(cfg.seed)
-        self.energy = np.zeros(self.grid_shape, dtype=np.float32)
-        # small random init for symmetry breaking
-        self.energy += self.rng.normal(0.0, 0.01, self.grid_shape).astype(np.float32)
+    def __init__(self, grid_shape: Tuple[int, int, int], pcfg: PhysicsCfg) -> None:
+        self.nx, self.ny, self.nz = [int(max(1, v)) for v in grid_shape]
+        self.energy = np.zeros((self.nx, self.ny, self.nz), dtype=np.float32)
 
-    @property
-    def nx(self) -> int: return self.grid_shape[0]
-    @property
-    def ny(self) -> int: return self.grid_shape[1]
-    @property
-    def nz(self) -> int: return self.grid_shape[2]
+        # Deterministic RNG derived from grid + physics signature
+        seed = _stable_seed_from(("physics", self.nx, self.ny, self.nz, pcfg.T, pcfg.flux_limit, pcfg.boundary_leak, pcfg.update_mode, pcfg.alpha))
+        self.rng = np.random.default_rng(seed)
 
-    def neighbors6(self, x: int, y: int, z: int) -> Iterable[Tuple[int,int,int]]:
-        if x+1 < self.nx: yield (x+1, y, z)
-        if x-1 >= 0    : yield (x-1, y, z)
-        if y+1 < self.ny: yield (x, y+1, z)
-        if y-1 >= 0    : yield (x, y-1, z)
-        if z+1 < self.nz: yield (x, y, z+1)
-        if z-1 >= 0    : yield (x, y, z-1)
-
-    def iter_coords(self) -> Iterable[Tuple[int,int,int]]:
-        for x in range(self.nx):
-            for y in range(self.ny):
-                for z in range(self.nz):
-                    yield (x,y,z)
+    def clamp_coords(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = np.clip(x, 0, self.nx - 1)
+        y = np.clip(y, 0, self.ny - 1)
+        z = np.clip(z, 0, self.nz - 1)
+        return x, y, z
 
 
-def step_diffuse(world: World3D) -> Dict[str, Any]:
+# ============================================================
+# Helpers
+# ============================================================
+
+def _stable_seed_from(items: Iterable[Any]) -> int:
     """
-    One update step of the background field:
-      1) Add white noise (std = T)
-      2) 6-neighbour isotropic diffusion (flux_limit = alpha)
-      3) Boundary leak at the 6 faces
-    Returns diagnostics for logging.
+    Deterministic 64-bit seed from a tuple of hashables.
     """
-    cfg = world.cfg
+    import hashlib, struct
+    h = hashlib.blake2b(repr(tuple(items)).encode("utf-8"), digest_size=8).digest()
+    return struct.unpack("<Q", h)[0] & ((1 << 63) - 1)
+
+
+def get_alpha(pcfg: PhysicsCfg) -> float:
+    """
+    Diffusion coefficient used by step_diffuse().
+    If pcfg.alpha is given, use it; otherwise return a conservative default.
+    """
+    if pcfg.alpha is not None:
+        return float(pcfg.alpha)
+    # conservative default suited for explicit 6-neighbour Laplacian
+    return 0.18
+
+
+# ============================================================
+# Core physics
+# ============================================================
+
+def step_diffuse(world: World3D, pcfg: PhysicsCfg) -> Dict[str, float]:
+    """
+    One explicit Euler diffusion step with 6-neighbour Laplacian,
+    boundary leakage, per-step flux limiting, and additive Gaussian noise.
+
+    Returns step statistics for diagnostics.
+    """
     E = world.energy
+    nx, ny, nz = world.nx, world.ny, world.nz
+    alpha = float(get_alpha(pcfg))
 
-    # (1) noise
-    if cfg.T > 0:
-        E = E + world.rng.normal(0.0, cfg.T, world.grid_shape).astype(np.float32)
+    # 6-neighbour Laplacian (Neumann in interior)
+    lap = np.zeros_like(E, dtype=np.float32)
+    # x
+    lap[1:-1, :, :] += E[2:, :, :] - 2 * E[1:-1, :, :] + E[0:-2, :, :]
+    # y
+    lap[:, 1:-1, :] += E[:, 2:, :] - 2 * E[:, 1:-1, :] + E[:, 0:-2, :]
+    # z
+    lap[:, :, 1:-1] += E[:, :, 2:] - 2 * E[:, :, 1:-1] + E[:, :, 0:-2]
 
-    # (2) diffusion with six neighbours (fast & in-bounds)
-    alpha = float(np.clip(cfg.flux_limit, 0.0, 1.0))
-    if alpha > 0:
-        nx, ny, nz = world.nx, world.ny, world.nz
-        mean = np.zeros_like(E, dtype=np.float32)
-        count = np.zeros_like(E, dtype=np.int32)
+    # Flux limiting for stability on large gradients
+    if pcfg.flux_limit is not None and pcfg.flux_limit > 0:
+        lim = float(pcfg.flux_limit)
+        np.clip(lap, -lim, +lim, out=lap)
 
-        def add_shift(dx: int, dy: int, dz: int) -> None:
-            xs = slice(max(0, dx), nx - max(0, -dx))
-            ys = slice(max(0, dy), ny - max(0, -dy))
-            zs = slice(max(0, dz), nz - max(0, -dz))
-            xs_src = slice(max(0, -dx), nx - max(0, dx))
-            ys_src = slice(max(0, -dy), ny - max(0, dy))
-            zs_src = slice(max(0, -dz), nz - max(0, dz))
-            mean[xs, ys, zs] += E[xs_src, ys_src, zs_src]
-            count[xs, ys, zs] += 1
+    # Explicit update
+    E += alpha * lap
 
-        for dx,dy,dz in ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)):
-            add_shift(dx,dy,dz)
-
-        mask = count > 0
-        mean[mask] = mean[mask] / count[mask]
-        E = (1.0 - alpha) * E
-        E[mask] += alpha * mean[mask]
-
-    # (3) boundary leak
-    leak = float(np.clip(cfg.boundary_leak, 0.0, 1.0))
-    if leak > 0:
-        E[ 0, :, :] *= (1.0 - leak)
+    # Boundary leakage (simple multiplicative decay at faces)
+    leak = float(max(0.0, min(1.0, pcfg.boundary_leak)))
+    if leak > 0.0:
+        E[0, :, :] *= (1.0 - leak)
         E[-1, :, :] *= (1.0 - leak)
-        E[:,  0, :] *= (1.0 - leak)
+        E[:, 0, :] *= (1.0 - leak)
         E[:, -1, :] *= (1.0 - leak)
-        E[:, :,  0] *= (1.0 - leak)
+        E[:, :, 0] *= (1.0 - leak)
         E[:, :, -1] *= (1.0 - leak)
 
-    world.energy = E
+    # Additive noise (temperature)
+    T = float(max(0.0, pcfg.T))
+    if T > 0.0:
+        E += world.rng.normal(0.0, T, size=E.shape).astype(np.float32)
 
+    # Return diagnostics
     return {
-        "sum_energy": float(np.sum(E)),
-        "mean_energy": float(np.mean(E)),
-        "max_energy": float(np.max(E)),
-        "std_energy": float(np.std(E)),
+        "alpha": alpha,
+        "leak": leak,
+        "T": T,
+        "mean": float(np.mean(E)),
+        "std": float(np.std(E)),
+        "min": float(np.min(E)),
+        "max": float(np.max(E)),
     }
 
 
-def detect_local_maxima(world: World3D, sigma_thresh: float = 3.0) -> Iterable[Tuple[int,int,int,float]]:
+def detect_local_maxima(world: World3D, sigma_thresh: float = 3.0) -> Iterator[Tuple[int, int, int, float]]:
     """
-    A cell is an event if it's strictly greater than all 6-neighbours AND > mean + sigma_thresh*std.
-    Checks interior cells only for speed.
+    Yield strict 6-neighbour local maxima above (mean + sigma_thresh * std).
+
+    This is vectorized and memory-safe. It returns an iterator of tuples:
+      (x, y, z, value)
     """
     E = world.energy
-    mean = float(np.mean(E))
-    std = float(np.std(E)) + 1e-12
-    cut = mean + sigma_thresh * std
+    mu = float(np.mean(E))
+    sd = float(np.std(E))
+    thr = mu + float(sigma_thresh) * sd
 
-    nx, ny, nz = world.nx, world.ny, world.nz
-    for x in range(1, nx-1):
-        for y in range(1, ny-1):
-            for z in range(1, nz-1):
-                v = float(E[x,y,z])
-                if v <= cut: continue
-                if (v > E[x+1,y,z] and v > E[x-1,y,z] and
-                    v > E[x,y+1,z] and v > E[x,y-1,z] and
-                    v > E[x,y,z+1] and v > E[x,y,z-1]):
-                    yield (x,y,z,v)
+    # Prepare neighbour shifts
+    # Interior-only comparisons to avoid padding overhead
+    core = E[1:-1, 1:-1, 1:-1]
+
+    gt_xm = core > E[0:-2, 1:-1, 1:-1]
+    gt_xp = core > E[2:,   1:-1, 1:-1]
+    gt_ym = core > E[1:-1, 0:-2, 1:-1]
+    gt_yp = core > E[1:-1, 2:,   1:-1]
+    gt_zm = core > E[1:-1, 1:-1, 0:-2]
+    gt_zp = core > E[1:-1, 1:-1, 2:]
+
+    is_local_max = gt_xm & gt_xp & gt_ym & gt_yp & gt_zm & gt_zp & (core > thr)
+
+    if not np.any(is_local_max):
+        return iter(())  # empty iterator
+
+    # Coordinates relative to the full grid
+    xi, yi, zi = np.nonzero(is_local_max)
+    xv = xi + 1
+    yv = yi + 1
+    zv = zi + 1
+    vals = core[is_local_max]
+
+    # Yield as simple tuples
+    for x, y, z, v in zip(xv, yv, zv, vals):
+        yield int(x), int(y), int(z), float(v)
 
 
-# ----------------------------
-# Catalysts (3D)
-# ----------------------------
-@dataclass
-class CatalystsCfg:
-    enabled: bool = True
-    max_count: int = 256
-    spawn_prob_base: float = 0.08  # per step probability, scaled by (1 - n/max)
-    strength: float = 0.75         # base injection strength
-    radius: float = 3.0            # gaussian sigma (in grid cells)
-    decay_per_step: float = 0.0025 # multiplicative decay of strength
-    jitter_std: float = 0.6        # random-walk step std (cells)
-    drift: Tuple[float,float,float] = (0.0,0.0,0.0)  # deterministic drift vector
-    reflect_at_boundary: bool = True
-    min_strength: float = 0.05     # drop when below this
-    deposit_clip: float = 2.0      # clip added energy per deposit (stability)
-
+# ============================================================
+# Catalysts system (minimal, deterministic)
+# ============================================================
 
 class CatalystsSystem:
     """
-    A population of point catalysts that wander (random walk + drift) and inject
-    localized energy via a 3D Gaussian kernel each step. Strength decays, and
-    new catalysts spawn stochastically up to max_count.
+    Lightweight particle system:
+      - Poisson births
+      - Bernoulli decays
+      - Gaussian-walk clamped to 6-neighbour hops
+      - Optional energy deposit at visited voxel
     """
     def __init__(self, world: World3D, cfg: CatalystsCfg) -> None:
         self.world = world
         self.cfg = cfg
-        self.rng = world.rng  # share RNG with world
-        self.pos: List[np.ndarray] = []  # float positions [x,y,z]
-        self.strength: List[float] = []
+        seed = _stable_seed_from(("catalysts", world.nx, world.ny, world.nz, cfg.spawn_rate, cfg.decay_p, cfg.deposit, cfg.walk_sigma, cfg.max_count, cfg.seed))
+        self.rng = np.random.default_rng(seed if cfg.seed is None else int(cfg.seed))
+        self.pos: np.ndarray = np.zeros((0, 3), dtype=np.int64)  # N x {x,y,z}
 
-    def _spawn_one(self) -> None:
-        x = self.rng.uniform(0, self.world.nx-1)
-        y = self.rng.uniform(0, self.world.ny-1)
-        z = self.rng.uniform(0, self.world.nz-1)
-        self.pos.append(np.array([x,y,z], dtype=np.float32))
-        self.strength.append(float(self.cfg.strength))
-
-    def _maybe_spawn(self) -> int:
-        n = len(self.pos)
-        if n >= self.cfg.max_count:
+    def _spawn(self) -> int:
+        if self.cfg.spawn_rate <= 0.0 or self.pos.shape[0] >= self.cfg.max_count:
             return 0
-        # scale probability down as we approach the cap
-        p = max(0.0, float(self.cfg.spawn_prob_base) * (1.0 - n / max(1, self.cfg.max_count)))
-        k = 0
-        if self.rng.random() < p:
-            self._spawn_one()
-            k = 1
-        return k
-
-    def _reflect_or_clamp(self, p: np.ndarray) -> np.ndarray:
-        if self.cfg.reflect_at_boundary:
-            # reflect at faces: if p < 0 -> -p; if p > max -> 2*max - p
-            if p[0] < 0: p[0] = -p[0]
-            if p[1] < 0: p[1] = -p[1]
-            if p[2] < 0: p[2] = -p[2]
-            if p[0] > self.world.nx-1: p[0] = 2*(self.world.nx-1) - p[0]
-            if p[1] > self.world.ny-1: p[1] = 2*(self.world.ny-1) - p[1]
-            if p[2] > self.world.nz-1: p[2] = 2*(self.world.nz-1) - p[2]
+        lam = float(self.cfg.spawn_rate)
+        births = int(self.rng.poisson(lam=lam))
+        if births <= 0:
+            return 0
+        births = int(min(births, max(0, self.cfg.max_count - self.pos.shape[0])))
+        if births <= 0:
+            return 0
+        xs = self.rng.integers(0, self.world.nx, size=births, endpoint=False)
+        ys = self.rng.integers(0, self.world.ny, size=births, endpoint=False)
+        zs = self.rng.integers(0, self.world.nz, size=births, endpoint=False)
+        batch = np.stack([xs, ys, zs], axis=1).astype(np.int64)
+        if self.pos.size == 0:
+            self.pos = batch
         else:
-            p[0] = np.clip(p[0], 0, self.world.nx-1)
-            p[1] = np.clip(p[1], 0, self.world.ny-1)
-            p[2] = np.clip(p[2], 0, self.world.nz-1)
-        return p
+            self.pos = np.concatenate([self.pos, batch], axis=0)
+        return births
 
-    def _deposit_gaussian(self, center: np.ndarray, amp: float, sigma: float) -> float:
-        """
-        Add a truncated 3D Gaussian blob centered near 'center' into world.energy.
-        Returns the total added energy (for diagnostics).
-        """
-        x0, y0, z0 = center
-        nx, ny, nz = self.world.nx, self.world.ny, self.world.nz
+    def _decay(self) -> int:
+        if self.pos.size == 0 or self.cfg.decay_p <= 0.0:
+            return 0
+        p = float(self.cfg.decay_p)
+        keep = self.rng.random(self.pos.shape[0]) > p
+        removed = int(self.pos.shape[0] - np.count_nonzero(keep))
+        if removed > 0:
+            self.pos = self.pos[keep]
+        return removed
 
-        # truncate at ~3 sigma for efficiency
-        r = max(1.0, sigma) * 3.0
-        xmin = int(max(0, np.floor(x0 - r)))
-        xmax = int(min(nx-1, np.ceil (x0 + r)))
-        ymin = int(max(0, np.floor(y0 - r)))
-        ymax = int(min(ny-1, np.ceil (y0 + r)))
-        zmin = int(max(0, np.floor(z0 - r)))
-        zmax = int(min(nz-1, np.ceil (z0 + r)))
-        if xmin > xmax or ymin > ymax or zmin > zmax:
-            return 0.0
+    def _walk_and_deposit(self) -> Tuple[int, float]:
+        if self.pos.size == 0:
+            return 0, 0.0
 
-        xs = np.arange(xmin, xmax+1, dtype=np.float32)
-        ys = np.arange(ymin, ymax+1, dtype=np.float32)
-        zs = np.arange(zmin, zmax+1, dtype=np.float32)
-        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+        # Gaussian proposal rounded to nearest axis step, clamped to {-1,0,1}
+        # Prefer axis-aligned 6-neighbour moves
+        s = max(1e-6, float(self.cfg.walk_sigma))
+        d = self.rng.normal(0.0, s, size=self.pos.shape)
+        d = np.round(d).astype(np.int64)
+        d = np.clip(d, -1, 1)
 
-        # isotropic gaussian
-        inv2s2 = 1.0 / (2.0 * (sigma**2 + 1e-12))
-        G = np.exp(-((X-x0)**2 + (Y-y0)**2 + (Z-z0)**2) * inv2s2).astype(np.float32)
-        blob = (amp * G).astype(np.float32)
+        # break ties to keep 6-neighbour: zero out two axes if multiple non-zeros
+        nonzero = (d != 0).astype(np.int64)
+        too_many = np.sum(nonzero, axis=1) > 1
+        if np.any(too_many):
+            # keep the axis with largest |delta|, zero the others
+            sel = np.argmax(np.abs(d[too_many]), axis=1)
+            mask = np.zeros_like(d[too_many])
+            mask[np.arange(mask.shape[0]), sel] = 1
+            d[too_many] = d[too_many] * mask
 
-        if self.cfg.deposit_clip is not None:
-            np.clip(blob, -float(self.cfg.deposit_clip), float(self.cfg.deposit_clip), out=blob)
-
-        self.world.energy[xmin:xmax+1, ymin:ymax+1, zmin:zmax+1] += blob
-        return float(np.sum(blob))
-
-    def update(self) -> Dict[str, Any]:
-        """
-        One catalysts step:
-          - Spawn (probabilistic)
-          - Random walk + optional drift, with boundary handling
-          - Deposit energy blobs
-          - Decay strength and prune weak
-        """
-        spawned = self._maybe_spawn()
-
-        if not self.pos:
-            return {"spawned": spawned, "alive": 0, "total_deposit": 0.0}
+        # apply move
+        self.pos[:, 0] += d[:, 0]
+        self.pos[:, 1] += d[:, 1]
+        self.pos[:, 2] += d[:, 2]
+        self.pos[:, 0], self.pos[:, 1], self.pos[:, 2] = self.world.clamp_coords(
+            self.pos[:, 0], self.pos[:, 1], self.pos[:, 2]
+        )
 
         total_deposit = 0.0
-        sigma = float(max(1e-6, self.cfg.radius))
-        decay = float(np.clip(self.cfg.decay_per_step, 0.0, 1.0))
-        jitter_std = float(max(0.0, self.cfg.jitter_std))
-        drift = np.array(self.cfg.drift, dtype=np.float32)
+        dep = float(self.cfg.deposit)
+        if dep != 0.0:
+            # vectorized in-place deposit
+            x, y, z = self.pos[:, 0], self.pos[:, 1], self.pos[:, 2]
+            self.world.energy[x, y, z] += dep
+            total_deposit = float(dep) * float(self.pos.shape[0])
 
-        new_pos: List[np.ndarray] = []
-        new_strength: List[float] = []
+        return int(self.pos.shape[0]), total_deposit
 
-        for p, s in zip(self.pos, self.strength):
-            # move
-            dp = self.rng.normal(0.0, jitter_std, size=3).astype(np.float32) + drift
-            p = p + dp
-            p = self._reflect_or_clamp(p)
-
-            # deposit
-            added = self._deposit_gaussian(p, amp=s, sigma=sigma)
-            total_deposit += added
-
-            # decay
-            s = s * (1.0 - decay)
-
-            if s >= self.cfg.min_strength:
-                new_pos.append(p)
-                new_strength.append(s)
-
-        self.pos = new_pos
-        self.strength = new_strength
-
-        # small chance to spawn >1 when population is very low
-        if len(self.pos) == 0 and self.cfg.enabled and self.cfg.max_count > 0:
-            if self.rng.random() < 0.5:
-                self._spawn_one(); spawned += 1
-
-        return {"spawned": spawned, "alive": len(self.pos), "total_deposit": float(total_deposit)}
-
-# ---- additive helper for observer/flux math (non-breaking) ----
-def get_alpha(cfg: PhysicsCfg) -> float:
-    """Return the numeric diffusion blend in [0,1] as used by step_diffuse."""
-    import numpy as np
-    return float(np.clip(cfg.flux_limit, 0.0, 1.0))
+    def step(self) -> Dict[str, float | int]:
+        spawned = self._spawn()
+        removed = self._decay()
+        alive, total_deposit = self._walk_and_deposit()
+        return {
+            "spawned": int(spawned),
+            "removed": int(removed),
+            "alive": int(alive),
+            "total_deposit": float(total_deposit),
+        }
