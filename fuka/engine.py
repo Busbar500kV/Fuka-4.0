@@ -1,290 +1,298 @@
+# fuka/engine.py
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple
+
 import numpy as np
-from .external_source import ExternalSource, ExternalSourceCfg
-from .bath import step_bath, BathCfg
-from .guess_field import GuessField, GuessFieldCfg
-from .observer import Observer, ObserverCfg
-from pathlib import Path
-from .encoder import Encoder, EncoderCfg
-from pathlib import Path
 
 from .physics import (
-    World3D, PhysicsCfg, step_diffuse, detect_local_maxima,
-    CatalystsCfg, CatalystsSystem
+    PhysicsCfg, World3D, step_diffuse, detect_local_maxima,
+    CatalystsCfg, CatalystsSystem, get_alpha
 )
+from .bath import BathCfg, step_bath
+from .external_source import ExternalSourceCfg, ExternalSource
+from .guess_field import GuessFieldCfg, GuessField
+from .observer import ObserverCfg, Observer
+from .encoder import EncoderCfg, Encoder
+
+# Recorder is provided by runner; we only assume it exposes:
+#   add(table: str, rows: List[dict])  and  finalize()
+try:
+    from .recorder import ParquetRecorder  # type: ignore
+except Exception:  # pragma: no cover
+    ParquetRecorder = object  # type: ignore
 
 
-class Engine:
+def _cfg_subset(dc_cls, src: Dict[str, Any]) -> Any:
+    """Filter a dict to dataclass fields."""
+    fields = {f.name for f in dc_cls.__dataclass_fields__.values()}  # type: ignore
+    return dc_cls(**{k: v for k, v in (src or {}).items() if k in fields})
+
+
+def _topk_flat_indices(arr: np.ndarray, k: int) -> np.ndarray:
+    k = int(max(0, k))
+    n = arr.size
+    if k <= 0 or n == 0:
+        return np.zeros((0,), dtype=np.int64)
+    if k >= n:
+        return np.arange(n, dtype=np.int64)
+    # argpartition for speed
+    idx = np.argpartition(arr.reshape(-1), -k)[-k:]
+    # sort descending by value
+    vals = arr.reshape(-1)[idx]
+    order = np.argsort(-vals, kind="stable")
+    return idx[order]
+
+
+def _edge_pairs_topk_by_grad(E: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    3D Engine (backward compatible):
-      - If cfg['world']['grid_shape'] present -> use (nx,ny,nz)
-      - Else if cfg['world']['grid_size'] present -> interpret as (N,1,1)
-      - Else fallback to (128,1,1)
-
-    Logs each step:
-      - ledger: sum/mean/std/max of energy (+ catalyst totals)
-      - spectra: histogram (counts + bin_edges)
-      - state: top-K cells by energy (x,y,z,value)
-      - edges: gradient edge to strongest 6-neighbour (subset of top-K)
-      - events: strict 6-neighbour local maxima above mean + sigma*std
-      - env: world + physics params (every N steps and at step 0)
-      - catalysts: (cid,x,y,z,strength)
+    Compute per-axis neighbor differences and select global top-k by |delta|.
+    Returns arrays: x0,y0,z0,x1,y1,z1,v0,v1  (all 1D of length <=k)
     """
-    def __init__(self, recorder, steps: int, cfg: Dict[str, Any] | None = None) -> None:
-        self.rec = recorder
-        self.steps = int(steps)
-        self.cfg = cfg or {}
+    nx, ny, nz = E.shape
+    # X edges
+    dx = E[1:,:,:] - E[:-1,:,:]
+    dy = E[:,1:,:] - E[:,:-1,:]
+    dz = E[:,:,1:] - E[:,:,:-1]
+    # Flatten magnitudes with axis tags
+    mags = [
+        (np.abs(dx).reshape(-1), 'x'),
+        (np.abs(dy).reshape(-1), 'y'),
+        (np.abs(dz).reshape(-1), 'z'),
+    ]
+    # total candidates
+    total = sum(m.shape[0] for m,_ in mags)
+    if k <= 0 or total == 0:
+        return tuple(np.zeros((0,), dtype=np.float32) for _ in range(8))  # type: ignore
 
-        # world shape
-        world_cfg = self.cfg.get("world", {})
-        if "grid_shape" in world_cfg:
-            nx,ny,nz = world_cfg["grid_shape"]
+    k = min(k, total)
+    # Concatenate magnitudes and track source axis and local index
+    cat = np.concatenate([m for m,_ in mags])
+    gidx = _topk_flat_indices(cat, k)
+    # Prepare outputs
+    x0=[];y0=[];z0=[];x1=[];y1=[];z1=[];v0=[];v1=[]
+    # Helper to map a flat index in an axis block to coordinates
+    sizes = [dx.size, dy.size, dz.size]
+    offsets = np.cumsum([0] + sizes)
+    for gi in gidx:
+        gi = int(gi)
+        if gi < offsets[1]:
+            # x edge
+            li = gi - offsets[0]
+            ix = li // (ny*nz)
+            rem = li % (ny*nz)
+            iy = rem // nz
+            iz = rem % nz
+            x0.append(ix); y0.append(iy); z0.append(iz)
+            x1.append(ix+1); y1.append(iy); z1.append(iz)
+            v0.append(float(E[ix,iy,iz])); v1.append(float(E[ix+1,iy,iz]))
+        elif gi < offsets[2]:
+            li = gi - offsets[1]
+            ix = li // ( (ny-1)*nz )
+            rem = li % ( (ny-1)*nz )
+            iy = rem // nz
+            iz = rem % nz
+            x0.append(ix); y0.append(iy); z0.append(iz)
+            x1.append(ix); y1.append(iy+1); z1.append(iz)
+            v0.append(float(E[ix,iy,iz])); v1.append(float(E[ix,iy+1,iz]))
         else:
-            n = int(world_cfg.get("grid_size", 256))
-            nx,ny,nz = int(n), 1, 1  # backward-compat 1D -> embedded 3D
+            li = gi - offsets[2]
+            ix = li // ( ny*(nz-1) )
+            rem = li % ( ny*(nz-1) )
+            iy = rem // (nz-1)
+            iz = rem % (nz-1)
+            x0.append(ix); y0.append(iy); z0.append(iz)
+            x1.append(ix); y1.append(iy); z1.append(iz+1)
+            v0.append(float(E[ix,iy,iz])); v1.append(float(E[ix,iy,iz+1]))
+    def arr(a): return np.asarray(a, dtype=np.float32)
+    return arr(x0),arr(y0),arr(z0),arr(x1),arr(y1),arr(z1),arr(v0),arr(v1)
 
-        # physics cfg
-        phy = self.cfg.get("physics", {})
-        self.pcfg = PhysicsCfg(
-            T=float(phy.get("T", 0.0015)),
-            flux_limit=float(phy.get("flux_limit", 0.20)),
-            boundary_leak=float(phy.get("boundary_leak", 0.01)),
-            radius=int(phy.get("radius", 1)),
-            seed=phy.get("seed", None),
-        )
 
-        self.world = World3D((nx,ny,nz), self.pcfg)
+@dataclass
+class Engine:
+    recorder: ParquetRecorder
+    steps: int
+    cfg: Dict[str, Any]
 
-        # catalysts cfg
-        cat_cfg = self.cfg.get("catalysts", {})
-        self.ccfg = CatalystsCfg(
-            enabled=bool(cat_cfg.get("enabled", True)),
-            max_count=int(cat_cfg.get("max_count", 256)),
-            spawn_prob_base=float(cat_cfg.get("spawn_prob_base", 0.08)),
-            strength=float(cat_cfg.get("strength", 0.75)),
-            radius=float(cat_cfg.get("radius", 3.0)),
-            decay_per_step=float(cat_cfg.get("decay_per_step", 0.0025)),
-            jitter_std=float(cat_cfg.get("jitter_std", 0.6)),
-            drift=tuple(cat_cfg.get("drift", (0.0,0.0,0.0))),
-            reflect_at_boundary=bool(cat_cfg.get("reflect_at_boundary", True)),
-            min_strength=float(cat_cfg.get("min_strength", 0.05)),
-            deposit_clip=float(cat_cfg.get("deposit_clip", 2.0)),
-        )
+    def __post_init__(self) -> None:
+        c = self.cfg
+
+        # ---- world & physics ----
+        wcfg = (c.get("world") or {})
+        grid_shape = tuple(int(x) for x in wcfg.get("grid_shape", (64,64,64)))
+        pcfg = _cfg_subset(PhysicsCfg, c.get("physics") or {})
+        self.world = World3D(grid_shape, pcfg)
+        self.pcfg = pcfg
+
+        # ---- subsystems ----
+        self.ecfg  = _cfg_subset(ExternalSourceCfg, c.get("external_source") or {})
+        self.ext   = ExternalSource(self.world, self.ecfg)
+
+        self.bcfg  = _cfg_subset(BathCfg, c.get("bath") or {})
+        self.gfcfg = _cfg_subset(GuessFieldCfg, c.get("guess_field") or {})
+        self.guess = GuessField(self.world, self.gfcfg)
+
+        # observer & encoder output directory
+        # try to derive from recorder.manifest_path: .../data/runs/<run_id>/manifest.json
+        out_dir = None
+        run_dir = None
+        try:
+            manifest_path = Path(getattr(self.recorder, "manifest_path"))
+            run_dir = manifest_path.parent
+            out_dir = run_dir
+        except Exception:
+            out_dir = Path("data") / "runs" / "UNKNOWN"
+
+        self.ocfg = _cfg_subset(ObserverCfg, c.get("observer") or {})
+        self.observer = Observer(self.world, self.ocfg, out_dir)
+
+        self.encfg = _cfg_subset(EncoderCfg, c.get("encoder") or {})
+        self.encoder = Encoder(self.world, self.encfg, out_dir)
+
+        self.ccfg = _cfg_subset(CatalystsCfg, c.get("catalysts") or {})
         self.catalysts = CatalystsSystem(self.world, self.ccfg)
 
-        # ---- NEW: external source / guess field / bath / observer ----
-        time_cfg = self.cfg.get("time", {})
-        dt_seconds = float(time_cfg.get("dt_seconds", 0.001))  # default 1 ms/step
-        
-        ext_cfg = self.cfg.get("external_source", {})
-        self.ext = ExternalSource(
-            self.world,
-            ExternalSourceCfg(
-                enabled=bool(ext_cfg.get("enabled", True)),
-                pulses=ext_cfg.get("pulses", []),
-                sinusoids=ext_cfg.get("sinusoids", []),
-                clip=float(ext_cfg.get("clip", 2.0)),
-                dt_seconds=dt_seconds,
-            )
-        )
+        # ---- IO policy ----
+        iocfg = c.get("io") or {}
+        self.flush_every = int(iocfg.get("flush_every", 200))
+        self.state_topk  = int(iocfg.get("state_topk", 400))
+        self.edges_topk  = int(iocfg.get("edges_topk", 0))
+        self.event_sigma = float(iocfg.get("event_threshold_sigma", 3.0))
+        self.log_env_every = int(iocfg.get("log_env_every", 200))
 
+        # ---- time ----
+        self.dt_seconds = float(((c.get("time") or {}).get("dt_seconds", 0.001)))
 
-        
-       
-        
-        gf_cfg = self.cfg.get("guess_field", {})
-        self.guess = GuessField(self.world, GuessFieldCfg(
-            enabled=bool(gf_cfg.get("enabled", True)),
-            eta=float(gf_cfg.get("eta", 0.2)),
-            decay=float(gf_cfg.get("decay", 0.05)),
-            diffuse=float(gf_cfg.get("diffuse", 0.02)),
-            s0=float(gf_cfg.get("s0", 0.5)),
-            sigma_c=float(gf_cfg.get("sigma_c", 3.0)),
-            sigma_reward=float(gf_cfg.get("sigma_reward", 1.5)),
-            beta_jitter=float(gf_cfg.get("beta_jitter", 2.0)),
-        ), harvest_mask=None)
-        
-        bath_cfg = self.cfg.get("bath", {})
-        self.bath = BathCfg(
-            enabled=bool(bath_cfg.get("enabled", True)),
-            mode=str(bath_cfg.get("mode", "energy")),
-            kappa=float(bath_cfg.get("kappa", 0.02)),
-            rho_max=float(bath_cfg.get("rho_max", 0.05)),
-        )
-        
-        obs_cfg = self.cfg.get("observer", {})
-        # recorder exposes run_dir path; we keep it as-is
-        run_dir = Path(self.rec.run_dir) if hasattr(self.rec, "run_dir") else Path(".")
-        self.observer = Observer(self.world, ObserverCfg(
-            enabled=bool(obs_cfg.get("enabled", True)),
-            lambda_edge=float(obs_cfg.get("lambda_edge", 0.98)),
-        ), out_dir=run_dir)
-        
-        encfg = self.cfg.get("encoder", {})
-        run_dir = Path(self.rec.run_dir) if hasattr(self.rec, "run_dir") else Path(".")
-        self.encoder = Encoder(
-            self.world,
-            EncoderCfg(
-                enabled=bool(encfg.get("enabled", True)),
-                eta=float(encfg.get("eta", 0.02)),
-                gamma=float(encfg.get("gamma", 0.02)),
-                lam=float(encfg.get("lam", 0.98)),
-                tau_encode=float(encfg.get("tau_encode", 0.05)),
-                save_every=int(encfg.get("save_every", 500))
-            ),
-            out_dir=run_dir
-        )
+        # counters
+        self._since_flush = 0
 
+        # log initial env
+        self._log_env(step=0, extra={"alpha": get_alpha(self.pcfg)})
 
-        # IO knobs
-        io = self.cfg.get("io", {})
-        self.state_topk = int(io.get("state_topk", 256))
-        self.edges_topk = int(io.get("edges_topk", 512))
-        self.spectra_bins = int(io.get("spectra_bins", 64))
-        self.event_sigma = float(io.get("event_threshold_sigma", 3.0))
-        self.log_env_every = int(io.get("log_env_every", 1000))
+    # ------------- helpers: recording -------------
+    def _rec(self, table: str, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        # recorder.add API (list[dict])
+        self.recorder.add(table, rows)  # type: ignore[attr-defined]
+        self._since_flush += 1
+        if self._since_flush >= self.flush_every:
+            # most recorder impls flush on demand per-table; finalize() at end handles any residue
+            self._since_flush = 0
 
-    # ------------ helpers ------------
-    def _topk_cells(self, k: int) -> List[Tuple[int,int,int,float]]:
-        E = self.world.energy
-        k = int(max(1, min(k, E.size)))
-        flat_idx = np.argpartition(E.ravel(), -k)[-k:]
-        flat_idx = flat_idx[np.argsort(E.ravel()[flat_idx])][::-1]  # sort descending
-        coords_vals: List[Tuple[int,int,int,float]] = []
-        nx, ny = self.world.nx, self.world.ny
-        for idx in flat_idx:
-            x = int(idx // (ny*self.world.nz))
-            rem = int(idx % (ny*self.world.nz))
-            y = int(rem // self.world.nz)
-            z = int(rem % self.world.nz)
-            coords_vals.append((x,y,z,float(E[x,y,z])))
-        return coords_vals
+    def _log_env(self, step: int, extra: Dict[str, Any] | None = None) -> None:
+        rows = [dict(step=int(step),
+                     dt_seconds=float(self.dt_seconds),
+                     alpha=float(get_alpha(self.pcfg)),
+                     nx=int(self.world.nx), ny=int(self.world.ny), nz=int(self.world.nz),
+                     **(extra or {}))]
+        self._rec("env", rows)
 
-    def _best_neighbour(self, x: int, y: int, z: int) -> Tuple[int,int,int,float] | None:
-        """Return neighbour with highest energy (6-connectivity)."""
-        best = None
-        best_v = -1e30
-        for xn, yn, zn in self.world.neighbors6(x,y,z):
-            v = float(self.world.energy[xn,yn,zn])
-            if v > best_v:
-                best_v = v; best = (xn,yn,zn,v)
-        return best
-
-    # ------------ main loop ------------
+    # ------------- main loop -------------
     def run(self) -> None:
-        # initial env log (step 0)
-        self.rec.log_env(step=0, nx=self.world.nx, ny=self.world.ny, nz=self.world.nz,
-                         T=self.pcfg.T, flux_limit=self.pcfg.flux_limit,
-                         boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius,
-                         catalysts_enabled=int(self.ccfg.enabled))
+        steps = int(self.steps)
+        rng = self.world.rng
 
-        for step in range(1, self.steps + 1):
-            
-            # 0) external pulses (time-varying source)
+        for step in range(steps):
+            # 0) external source (deterministic given cfg + seed)
             try:
                 self.ext.step(step)
             except Exception:
-                pass  # never break a run
-            
-            # 1) top-down catalyst guess (DishBrain-style structured vs noisy)
+                pass
+
+            # 1) top-down guess field (DishBrain-inspired)
             try:
                 self.guess.step(step, k_fires=1)
             except Exception:
                 pass
-            
-            # 2.1) capture a copy of the field for pre-mix flux
+
+            # 2) keep a copy before mixing for encoder features
             E_pre = self.world.energy.copy()
-            
-            # 2.2) background field update (unchanged physics)
-            stats = step_diffuse(self.world)
-            
-            # 3) global bath dissipation (existence coupling)
+
+            # 3) physics: diffuse + boundary leak + noise
+            stats = step_diffuse(self.world, self.pcfg)
+
+            # 4) bath scaling
             try:
-                rho = step_bath(self.world, self.bath)
-                # let guess field see post-bath energy for reward/penalty update
-                self.guess.post_bath_update()
+                rho = step_bath(self.world, self.bcfg)
             except Exception:
                 rho = 0.0
-            
-            # 4) existing wandering catalysts (as before)
-            cat_totals = {"spawned": 0, "alive": 0, "total_deposit": 0.0}
-            if self.ccfg.enabled:
-                cat_totals = self.catalysts.update()
-            
-            # 5) intrinsic observer accumulation
-            try:
-                # encoded connections update uses pre-mix field
-                self.encoder.step(E_pre)
-                # periodic checkpoint so encoded_edges.npz exists mid-run
-                if self.encoder.cfg.enabled and (step % max(1, self.encoder.cfg.save_every)) == 0:
-                    self.encoder.save()
 
+            # 5) catalysts (spawn/walk/deposit/decay)
+            try:
+                cat_stats = self.catalysts.step()
             except Exception:
-                pass
-            
+                cat_stats = {"spawned": 0, "alive": 0, "total_deposit": 0.0}
+
+            # 6) observer & encoder
             try:
                 self.observer.step()
             except Exception:
                 pass
+            try:
+                self.encoder.step(E_pre)
+            except Exception:
+                pass
 
-            # ledger (rollups)
-            self.rec.log_ledger(step=step, **stats, cat_alive=int(cat_totals["alive"]),
-                                cat_spawned=int(cat_totals["spawned"]),
-                                cat_deposit=float(cat_totals["total_deposit"]))
+            # 7) record sparse state top-k
+            if self.state_topk > 0:
+                E = self.world.energy
+                idx = _topk_flat_indices(E, self.state_topk)
+                if idx.size:
+                    x = (idx // (self.world.ny * self.world.nz)).astype(np.int64)
+                    rem = idx % (self.world.ny * self.world.nz)
+                    y = (rem // self.world.nz).astype(np.int64)
+                    z = (rem % self.world.nz).astype(np.int64)
+                    rows = [dict(step=int(step),
+                                 x=int(xi), y=int(yi), z=int(zi),
+                                 value=float(E[xi, yi, zi]))
+                            for xi, yi, zi in zip(x, y, z)]
+                    self._rec("state", rows)
 
-            # spectra (histogram)
-            counts, edges = np.histogram(self.world.energy, bins=self.spectra_bins)
-            self.rec.log_spectrum(
-                step=step,
-                bin_edges=edges.astype(float).tolist(),
-                counts=counts.astype(int).tolist(),
-            )
+            # 8) record edges by gradient strength (optional)
+            if self.edges_topk > 0:
+                E = self.world.energy
+                x0,y0,z0,x1,y1,z1,v0,v1 = _edge_pairs_topk_by_grad(E, self.edges_topk)
+                if x0.size:
+                    rows = [dict(step=int(step),
+                                 x0=int(x0[i]), y0=int(y0[i]), z0=int(z0[i]),
+                                 x1=int(x1[i]), y1=int(y1[i]), z1=int(z1[i]),
+                                 v0=float(v0[i]), v1=float(v1[i]))
+                            for i in range(x0.size)]
+                    self._rec("edges", rows)
 
-            # catalysts (positions/strengths)
-            if self.ccfg.enabled and self.catalysts.pos:
-                for cid, (p, s) in enumerate(zip(self.catalysts.pos, self.catalysts.strength)):
-                    self.rec.log_catalyst(step=step, cid=int(cid),
-                                          x=float(p[0]), y=float(p[1]), z=float(p[2]),
-                                          strength=float(s))
+            # 9) events via strict local maxima
+            try:
+                events = []
+                for (xi, yi, zi, v) in detect_local_maxima(self.world, sigma_thresh=self.event_sigma):
+                    events.append(dict(step=int(step), x=int(xi), y=int(yi), z=int(zi), value=float(v)))
+                if events:
+                    self._rec("events", events)
+            except Exception:
+                pass
 
-            # state (top-K energetic cells)
-            top_state = self._topk_cells(self.state_topk)
-            for (x,y,z,v) in top_state:
-                self.rec.log_state(step=step, x=int(x), y=int(y), z=int(z), value=float(v))
+            # 10) periodic env log
+            if self.log_env_every > 0 and (step % self.log_env_every) == 0 and step != 0:
+                self._log_env(step, extra={"rho": float(rho)})
 
-            # edges (each top cell -> strongest neighbour)
-            e_logged = 0
-            for (x,y,z,v) in top_state[:min(self.edges_topk, len(top_state))]:
-                nb = self._best_neighbour(x,y,z)
-                if nb is None: continue
-                xn,yn,zn,vn = nb
-                if (xn,yn,zn) == (x,y,z): continue
-                self.rec.log_edge(step=step,
-                                  x0=int(x), y0=int(y), z0=int(z), v0=float(v),
-                                  x1=int(xn),y1=int(yn),z1=int(zn), v1=float(vn))
-                e_logged += 1
-                if e_logged >= self.edges_topk: break
+        # end loop
 
-            # events (strict local maxima by sigma)
-            for (x,y,z,v) in detect_local_maxima(self.world, sigma_thresh=self.event_sigma):
-                self.rec.log_event(step=step, x=int(x), y=int(y), z=int(z), value=float(v))
+        # attempt to write closing env snapshot
+        try:
+            self._log_env(steps, extra={"done": 1})
+        except Exception:
+            pass
 
-            # env periodic
-            if (step % self.log_env_every) == 0:
-                self.rec.log_env(step=step, nx=self.world.nx, ny=self.world.ny, nz=self.world.nz,
-                                 T=self.pcfg.T, flux_limit=self.pcfg.flux_limit,
-                                 boundary_leak=self.pcfg.boundary_leak, radius=self.pcfg.radius,
-                                 catalysts_enabled=int(self.ccfg.enabled))
-
+        # finalize observer/encoder artifacts if possible
         try:
             self.observer.finalize({"rho_last": float(rho) if 'rho' in locals() else 0.0})
         except Exception:
             pass
-
         try:
             self.encoder.save()
         except Exception:
             pass
-        
-        self.rec.finalize()
+
+        # flush recorder
+        self.recorder.finalize()
