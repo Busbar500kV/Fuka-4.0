@@ -1,119 +1,241 @@
+# fuka/recorder.py
 from __future__ import annotations
-from dataclasses import dataclass
+
+"""
+Parquet-backed recorder for Fuka.
+
+Features
+- Deterministic folder layout: data/runs/<run_id>/{shards,logs}
+- Buffered per-table writes to *.parquet shards (append-by-batch, rotate by row count)
+- Stable schemas (first batch defines order; later batches permute to match)
+- Writes run-level manifest.json and per-table *_index.json on finalize()
+- Optional HTTPS prefix for indices via env DATA_URL_PREFIX or ctor arg
+- Idempotent finalize() (safe to call more than once)
+
+Tables commonly used:
+  state:   step,int | x,y,z,int | value,float
+  edges:   step,int | x0..z1,int | v0,v1,float | [deposit?,kappa?]
+  events:  step,int | x,y,z,int | value,float
+  catalysts, spectra, ledger, env: flexible (will persist provided fields)
+
+Notes
+- We avoid keeping files open between calls (safer for long headless runs).
+- We don't depend on pyarrow schemas being predeclared; we normalize column order.
+"""
+
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
+import json
+import os
+import time
+import threading
 
 import pandas as pd
-import time
-import json
-
-# Added "catalysts" table
-TABLES = ("events", "spectra", "state", "ledger", "edges", "env", "catalysts")
 
 
 @dataclass
+class _TableBuf:
+    name: str
+    schema: List[str] = field(default_factory=list)       # column order
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+    shards: List[str] = field(default_factory=list)       # relative paths data/runs/<run_id>/shards/xxx.parquet
+    written_rows: int = 0
+    shard_seq: int = 0
+
+
+def _stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ensure_dirs(run_dir: Path) -> None:
+    (run_dir / "shards").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+
+def _rel_shard_path(run_id: str, fname: str) -> str:
+    # manifest uses paths relative to repo root starting at "data/"
+    return str(Path("data") / "runs" / run_id / "shards" / fname)
+
+
+def _httpize(prefix: Optional[str], rel_data_path: str) -> str:
+    if not prefix:
+        return rel_data_path
+    p = rel_data_path
+    if p.startswith("data/"):
+        p = p[len("data/"):]
+    return prefix.rstrip("/") + "/" + p.lstrip("/")
+
+
 class ParquetRecorder:
     """
-    Writes table buffers to Parquet shards under:
-        <data_root>/<run_id>/shards/<table>_000.parquet
+    Minimal interface used by engine:
+      add(table: str, rows: List[dict])
+      finalize()
 
-    Maintains a manifest.json the Streamlit UI expects:
-        {
-          "run_id": "...",
-          "created_at": <epoch_seconds_float>,
-          "created_at_iso": "YYYY-MM-DDTHH:MM:SSZ",
-          "shards": [{"table":"events","path":"data/runs/<RUN_ID>/shards/events_000.parquet"}, ...]
-        }
-
-    Notes:
-    - "path" entries are RELATIVE under "data/..." (UI prepends DATA_URL_PREFIX)
-    - Every row you log must include a "step" integer
+    Extra attributes:
+      manifest_path -> Path to manifest.json (used by Engine for out_dir inference)
     """
-    data_root: str
-    run_id: str
-    flush_every: int = 1000
 
-    def __post_init__(self) -> None:
-        self.root = Path(self.data_root)
-        self.run_dir = self.root / self.run_id
-        self.shards_dir = self.run_dir / "shards"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.shards_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        data_root: str | Path = "data",
+        run_id: Optional[str] = None,
+        *,
+        https_prefix: Optional[str] = None,
+        max_rows_per_shard: int = 200_000,
+        flush_hint_rows: int = 10_000,
+    ) -> None:
+        self.data_root = Path(data_root)
+        self.run_id = run_id or f"FUKA_{int(time.time())}"
+        self.run_dir = self.data_root / "runs" / self.run_id
+        _ensure_dirs(self.run_dir)
 
-        self._buf: Dict[str, List[Dict[str, Any]]] = {t: [] for t in TABLES}
-        self._next_idx: Dict[str, int] = {t: 0 for t in TABLES}
+        # public prefix for index URLs
+        self.https_prefix = https_prefix or os.environ.get("DATA_URL_PREFIX") or None
 
-        now = time.time()
-        self.manifest_path = self.run_dir / "manifest.json"
-        self._manifest: Dict[str, Any] = {
+        # shard policy
+        self.max_rows_per_shard = int(max_rows_per_shard)
+        self.flush_hint_rows = int(flush_hint_rows)
+
+        # tables
+        self._tables: Dict[str, _TableBuf] = {}
+
+        # thread lock (in case add() is called cross-threads)
+        self._lock = threading.Lock()
+
+        # manifest location (exposed)
+        self.manifest_path: Path = self.run_dir / "manifest.json"
+
+        # write a tiny meta
+        meta = {
             "run_id": self.run_id,
-            "created_at": float(now),
-            "created_at_iso": pd.Timestamp.utcfromtimestamp(now).isoformat() + "Z",
-            "shards": []
+            "created_utc": _stamp(),
+            "data_root": str(self.data_root),
+            "https_prefix": self.https_prefix,
         }
-        self._write_manifest()
+        with (self.run_dir / "run_meta.json").open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
 
-    # ---------------- logging APIs ----------------
-    def log_event(self, **row: Any) -> None:
-        self._buf["events"].append(self._with_common(row)); self._maybe_flush("events")
+    # ---------------------- public API ----------------------
 
-    def log_spectrum(self, **row: Any) -> None:
-        self._buf["spectra"].append(self._with_common(row)); self._maybe_flush("spectra")
-
-    def log_state(self, **row: Any) -> None:
-        self._buf["state"].append(self._with_common(row)); self._maybe_flush("state")
-
-    def log_ledger(self, **row: Any) -> None:
-        self._buf["ledger"].append(self._with_common(row)); self._maybe_flush("ledger")
-
-    def log_edge(self, **row: Any) -> None:
-        self._buf["edges"].append(self._with_common(row)); self._maybe_flush("edges")
-
-    def log_env(self, **row: Any) -> None:
-        self._buf["env"].append(self._with_common(row)); self._maybe_flush("env")
-
-    def log_catalyst(self, **row: Any) -> None:
-        self._buf["catalysts"].append(self._with_common(row)); self._maybe_flush("catalysts")
-
-    # ---------------- housekeeping ----------------
-    def _with_common(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        if "step" not in row:
-            raise ValueError("All rows must include 'step'")
-        return row
-
-    def _maybe_flush(self, table: str) -> None:
-        if len(self._buf[table]) >= self.flush_every:
-            self._flush_table(table)
-
-    def _flush_table(self, table: str) -> None:
-        buf = self._buf[table]
-        if not buf:
+    def add(self, table: str, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
             return
-        idx = self._next_idx[table]
-        fname = f"{table}_{idx:03d}.parquet"
-        path = self.shards_dir / fname
+        with self._lock:
+            T = self._tables.get(table)
+            if T is None:
+                T = _TableBuf(name=table)
+                self._tables[table] = T
 
-        df = pd.DataFrame(buf)
-        if "step" in df.columns:
-            cols = ["step"] + [c for c in df.columns if c != "step"]
-            df = df[cols]
+            # Update schema on first batch
+            if not T.schema:
+                # Preserve user-provided order, but ensure 'step' first when present
+                first = list(rows[0].keys())
+                if "step" in first:
+                    first = ["step"] + [k for k in first if k != "step"]
+                T.schema = first
 
-        df.to_parquet(path, index=False)
+            # Buffer rows
+            T.rows.extend(rows)
 
-        rel = f"data/runs/{self.run_id}/shards/{fname}"
-        self._manifest["shards"].append({"table": table, "path": rel})
-        self._write_manifest()
-
-        self._buf[table].clear()
-        self._next_idx[table] = idx + 1
-
-    def _write_manifest(self) -> None:
-        tmp = self.manifest_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self._manifest, indent=2))
-        tmp.replace(self.manifest_path)
+            # Opportunistic flush for big buffers
+            if len(T.rows) >= self.flush_hint_rows:
+                self._flush_table(T)
 
     def finalize(self) -> None:
-        for t in TABLES:
-            if self._buf[t]:
-                self._flush_table(t)
-        self._write_manifest()
+        # Flush any remaining buffers
+        with self._lock:
+            for T in self._tables.values():
+                self._flush_table(T, force=True)
+
+            # Write *_index.json per table and manifest.json
+            self._write_indices_and_manifest()
+
+    # ---------------------- internals ----------------------
+
+    def _flush_table(self, T: _TableBuf, force: bool = False) -> None:
+        if not T.rows:
+            return
+
+        # rotate shard if needed
+        if (not force) and T.written_rows >= self.max_rows_per_shard:
+            # safety: in practice written_rows will be reset below; this branch kept for clarity
+            pass
+
+        # Decide shard filename (rotate by sequence)
+        if (T.written_rows == 0) or (T.written_rows >= self.max_rows_per_shard):
+            T.shard_seq += 1
+            T.written_rows = 0
+
+        fname = f"{T.name}_{T.shard_seq:04d}.parquet"
+        rel_path = _rel_shard_path(self.run_id, fname)
+        abs_path = self.run_dir / "shards" / Path(fname).name
+
+        # Normalize dataframe to stable column order (extend missing cols with NaN)
+        df = pd.DataFrame.from_records(T.rows)
+        # expand schema if new columns appear later
+        new_cols = [c for c in df.columns if c not in T.schema]
+        if new_cols:
+            T.schema += new_cols
+        # ensure all schema columns are present in df
+        for col in T.schema:
+            if col not in df.columns:
+                df[col] = pd.NA
+        df = df[T.schema]
+
+        # Fix dtypes for common fields
+        for col in df.columns:
+            if col == "step" or col.endswith(("x", "y", "z")) or col.endswith(("x0", "y0", "z0", "x1", "y1", "z1")):
+                # integers but allow missing -> Int64 (nullable)
+                try:
+                    df[col] = df[col].astype("Int64")
+                except Exception:
+                    pass
+            elif col in ("value", "v0", "v1", "deposit", "kappa"):
+                try:
+                    df[col] = df[col].astype("float32")
+                except Exception:
+                    pass
+
+        # Append or write new shard
+        # Strategy: each shard seq writes once (no appends) for simplicity and robustness.
+        # If you want true appending, swap to pyarrow.dataset with append mode.
+        df.to_parquet(abs_path, index=False)
+        if rel_path not in T.shards:
+            T.shards.append(rel_path)
+        T.written_rows += len(T.rows)
+        T.rows.clear()
+
+    def _write_indices_and_manifest(self) -> None:
+        shards_dir = self.run_dir / "shards"
+        # Per-table indices
+        for name, T in self._tables.items():
+            files = [self._maybe_url(p) for p in T.shards]
+            index_payload = {
+                "table": name,
+                "run_id": self.run_id,
+                "files": files,
+                "count": len(files),
+            }
+            with (shards_dir / f"{name}_index.json").open("w", encoding="utf-8") as f:
+                json.dump(index_payload, f, indent=2)
+
+        # Manifest (flat list of shards)
+        shards = []
+        for name, T in self._tables.items():
+            for rel in T.shards:
+                shards.append({"table": name, "path": rel})
+
+        manifest = {
+            "run_id": self.run_id,
+            "root": f"data/runs/{self.run_id}",
+            "created_utc": _stamp(),
+            "tables": sorted(self._tables.keys()),
+            "shards": shards,
+        }
+        with self.manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+    def _maybe_url(self, rel_path: str) -> str:
+        return _httpize(self.https_prefix, rel_path)
