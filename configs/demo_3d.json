@@ -1,0 +1,64 @@
+{
+  "world": {
+    "grid_shape": [48, 48, 32]
+  },
+  "physics": {
+    "T": 0.0015,
+    "flux_limit": 0.2,
+    "boundary_leak": 0.01,
+    "update_mode": "euler",
+    "alpha": 0.18
+  },
+  "bath": {
+    "target_std": 0.5,
+    "rate": 0.25
+  },
+  "external_source": {
+    "kind": "moving_pulse",
+    "amplitude": 0.05,
+    "start_step": 10,
+    "stop_step": 150,
+    "every": 2,
+    "start_coord": [8, 8, 4],
+    "end_coord": [40, 40, 24],
+    "omega_hz": 1.0,
+    "dt_seconds": 0.001
+  },
+  "guess_field": {
+    "amplitude": 0.03,
+    "k_fires": 2,
+    "mode": "maxima",
+    "decay": 0.92
+  },
+  "catalysts": {
+    "spawn_rate": 0.5,
+    "decay_p": 0.01,
+    "deposit": 0.002,
+    "walk_sigma": 0.7,
+    "max_count": 5000
+  },
+  "observer": {
+    "log_every": 20
+  },
+  "encoder": {
+    "enabled": true,
+    "every": 5,
+    "topk_edges": 5000,
+    "cumulative": true,
+    "out_subdir": "enc",
+    "max_edges_total": 2000000
+  },
+  "io": {
+    "flush_every": 100,
+    "state_topk": 2000,
+    "edges_topk": 0,
+    "event_threshold_sigma": 3.0,
+    "log_env_every": 50
+  },
+  "time": {
+    "dt_seconds": 0.001
+  },
+  "run": {
+    "steps": 400
+  }
+}
