@@ -1,200 +1,131 @@
 # fuka/runner.py
 from __future__ import annotations
-
-"""
-Headless runner for Fuka.
-
-Responsibilities
-- Load a config, choose/normalize a run_id, and ensure a clean run directory.
-- Invoke the engine's headless execution (compatible with both old and new signatures).
-- Always rebuild per-table indexes and the run-level manifest on completion.
-- Emit clear, machine-parseable logs and non-zero exit codes on hard failures.
-
-This file does not render or upload. Rendering/publishing is handled by external scripts.
-"""
-
 import argparse
-import datetime as _dt
 import json
 import os
-import sys
 from pathlib import Path
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
-# Engine entrypoint (we support both signatures shown in historical code)
-try:
-    # Typical location in this repo
-    from core.engine import run_headless as _engine_run_headless  # type: ignore
-except Exception:
-    # Fallback if module path differs (older repo layouts)
-    from engine import run_headless as _engine_run_headless  # type: ignore
+# NOTE:
+# - This runner is the single blessed entrypoint for headless jobs.
+# - It reads a JSON config, prepares data/runs/<RUN_ID>, writes run_meta.json,
+#   and invokes fuka.engine.Engine with deterministic settings.
+#
+# Canonical pipeline (Master Plan v2):
+#   python -m fuka.runner --config configs/smoke.json --data_root data --run_id <ID> [--prefix HTTPS]
+#
+# Outputs:
+#   data/runs/<RUN_ID>/shards/*.parquet
+#   data/runs/<RUN_ID>/run_meta.json
 
-# Index/manifest builder
-try:
-    from analytics.build_indices import rebuild_indices as _rebuild_indices  # type: ignore
-except Exception:
-    _rebuild_indices = None  # type: ignore
-
-
-def _stamp() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+ISO = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _ts_run_id(prefix: str = "FUKA_4_0_3D") -> str:
-    return f"{prefix}_{_dt.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime(ISO)
 
 
-def _echo(level: str, msg: str) -> None:
-    print(f"[{_stamp()}] [{level}] {msg}", flush=True)
+def _load_config(cfg_path: str) -> Dict[str, Any]:
+    p = Path(cfg_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"[runner] Config not found: {cfg_path}")
+    with p.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError("[runner] Config must be a JSON object")
+    return obj
 
 
-def _ensure_run_dir(data_root: Path, run_id: str) -> Path:
-    run_dir = data_root / "runs" / run_id
-    (run_dir / "shards").mkdir(parents=True, exist_ok=True)
-    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
-    return run_dir
+def _ensure_run_id(run_id: Optional[str]) -> str:
+    if run_id and run_id.strip():
+        return run_id.strip()
+    return f"FUKA_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
 
-def _write_meta(run_dir: Path, meta: dict) -> None:
-    meta_path = run_dir / "run_meta.json"
-    with meta_path.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+def _write_run_meta(run_dir: Path, cfg: Dict[str, Any], run_id: str, prefix: str) -> None:
+    meta = {
+        "run_id": run_id,
+        "created_at": _utc_now(),
+        "config_snapshot": cfg,
+        "data_url_prefix": prefix,
+        "version": "4.0-master-plan-v2",
+    }
+    (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def _find_latest_run(data_root: Path) -> Optional[str]:
-    runs_dir = data_root / "runs"
-    if not runs_dir.is_dir():
-        return None
-    cands = [p for p in runs_dir.iterdir() if p.is_dir()]
-    if not cands:
-        return None
-    latest = max(cands, key=lambda p: p.stat().st_mtime)
-    return latest.name
-
-
-def _call_engine(config_path: Path, data_root: Path, run_id: str) -> None:
+def run(config: str, data_root: str, run_id: Optional[str] = None, prefix: str = "") -> str:
     """
-    Call engine.run_headless with best-effort signature compatibility:
-      - Newer: run_headless(config_path: str, data_root: str, run_id: str)
-      - Older: run_headless(config_path: str, data_root: str)
-    """
-    os.environ["FUKA_RUN_ID"] = run_id  # courtesy for engines that read env
-
-    try:
-        _echo("INFO", f"Calling engine.run_headless(config='{config_path}', data_root='{data_root}', run_id='{run_id}')")
-        _engine_run_headless(str(config_path), str(data_root), str(run_id))  # type: ignore[arg-type]
-        return
-    except TypeError:
-        _echo("WARN", "Engine run_headless() does not accept run_id; falling back to (config_path, data_root).")
-        _engine_run_headless(str(config_path), str(data_root))  # type: ignore[arg-type]
-        return
-
-
-def run(
-    config_path: Path,
-    data_root: Path = Path("data"),
-    run_id: Optional[str] = None,
-    prefix: Optional[str] = None,
-    skip_index: bool = False,
-) -> str:
-    """
-    Execute a headless simulation and (optionally) rebuild indices/manifest.
+    Headless entrypoint used by scripts and UI.
 
     Returns the resolved run_id.
     """
-    resolved_run_id = run_id or _ts_run_id()
-    run_dir = _ensure_run_dir(data_root, resolved_run_id)
+    cfg = _load_config(config)
+    rid = _ensure_run_id(run_id)
 
-    _echo("RUN", f"run_id={resolved_run_id}")
-    _echo("INFO", f"data_root={data_root}")
-    _echo("INFO", f"config={config_path}")
-    if prefix:
-        _echo("INFO", f"public_prefix={prefix}")
+    data_root_p = Path(data_root)
+    run_dir = data_root_p / "runs" / rid
+    shards_dir = run_dir / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
 
-    # Minimal meta upfront (useful if crash happens early)
-    _write_meta(
-        run_dir,
-        {
-            "run_id": resolved_run_id,
-            "created_utc": _stamp(),
-            "data_root": str(data_root),
-            "config_path": str(config_path),
-            "public_prefix": prefix,
-            "host": os.uname().nodename if hasattr(os, "uname") else "unknown",
-            "pid": os.getpid(),
-        },
-    )
+    _write_run_meta(run_dir, cfg, rid, prefix)
 
-    # Execute engine
+    # Defer import to avoid circulars and to ensure this file is usable even if other code is missing.
     try:
-        _call_engine(config_path, data_root, resolved_run_id)
+        from .engine import Engine  # type: ignore
     except Exception as e:
-        _echo("FATAL", f"Engine failed: {type(e).__name__}: {e}")
-        raise
+        raise RuntimeError(
+            "[runner] Could not import fuka.engine.Engine. "
+            "Make sure fuka/engine.py matches Master Plan v2."
+        ) from e
 
-    # If engine ignored run_id, try to recover latest written run
-    if not (data_root / "runs" / resolved_run_id / "shards").glob("*.parquet"):
-        latest = _find_latest_run(data_root)
-        if latest and latest != resolved_run_id:
-            _echo("WARN", f"No shards found under run_id '{resolved_run_id}'. Using latest found run '{latest}'.")
-            resolved_run_id = latest
-            run_dir = data_root / "runs" / resolved_run_id
+    # Seed & steps defaults (deterministic small → scalable)
+    run_cfg = cfg.get("run", {})
+    steps = int(run_cfg.get("steps", 100))
+    seed = int(run_cfg.get("seed", 42))
 
-    # Rebuild indices/manifest
-    if not skip_index:
-        if _rebuild_indices is None:
-            _echo("ERROR", "analytics.build_indices not available; skipping index/manifest rebuild.")
-        else:
-            try:
-                _rebuild_indices(str(data_root), resolved_run_id, prefix)
-                _echo("OK", f"indices + manifest rebuilt for run_id={resolved_run_id}")
-            except Exception as e:
-                _echo("ERROR", f"Index/manifest rebuild failed: {type(e).__name__}: {e}")
+    world_cfg = cfg.get("world", {})
+    grid = world_cfg.get("grid_shape", [16, 16, 16])
+    if not (isinstance(grid, (list, tuple)) and len(grid) == 3):
+        raise ValueError("[runner] world.grid_shape must be a list of 3 ints")
 
-    # Final meta
-    _write_meta(
-        run_dir,
-        {
-            "run_id": resolved_run_id,
-            "completed_utc": _stamp(),
-            "data_root": str(data_root),
-            "config_path": str(config_path),
-            "public_prefix": prefix,
-        },
+    # Optional physics params pass-through
+    physics_cfg = cfg.get("physics", {})
+
+    # Build and execute the engine
+    engine = Engine(
+        data_root=str(data_root_p),
+        run_id=rid,
+        steps=steps,
+        seed=seed,
+        grid_shape=tuple(int(x) for x in grid),
+        physics_cfg=physics_cfg,
+        url_prefix=prefix or "",
     )
+    engine.run()  # ← writes shards/*.parquet deterministically
 
-    _echo("DONE", f"run_id={resolved_run_id}")
-    return resolved_run_id
+    return rid
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Fuka headless runner")
-    ap.add_argument("--config", required=True, help="Path to simulation config (JSON/YAML)")
-    ap.add_argument("--data_root", default="data", help="Data root (default: data)")
-    ap.add_argument("--run_id", default=None, help="Override run id (default: timestamped)")
-    ap.add_argument(
-        "--prefix",
-        default=os.environ.get("DATA_URL_PREFIX", "").strip() or None,
-        help="Public HTTPS prefix for indices (e.g., https://storage.googleapis.com/fuka4-runs)",
+def _parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Fuka 4.0 headless runner (Master Plan v2)")
+    ap.add_argument("--config", required=True, help="Path to JSON config (e.g., configs/smoke.json)")
+    ap.add_argument("--data_root", default="data", help="Data root directory (default: data)")
+    ap.add_argument("--run_id", default="", help="Optional run_id; autogenerated if empty")
+    ap.add_argument("--prefix", default=os.environ.get("DATA_URL_PREFIX", ""), help="Public HTTPS prefix for indices/packer")
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    rid = run(
+        config=args.config,
+        data_root=args.data_root,
+        run_id=(args.run_id or None),
+        prefix=args.prefix or "",
     )
-    ap.add_argument("--skip_index", action="store_true", help="Skip index/manifest rebuild")
-    return ap.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
-    try:
-        run(
-            config_path=Path(args.config),
-            data_root=Path(args.data_root),
-            run_id=args.run_id,
-            prefix=args.prefix,
-            skip_index=bool(args.skip_index),
-        )
-    except Exception:
-        return 2
-    return 0
+    print(f"[runner] Done. Data under: {Path(args.data_root) / 'runs' / rid}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
